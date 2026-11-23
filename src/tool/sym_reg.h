@@ -1,0 +1,70 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * Copyright (C) 2026 dere3046
+ */
+
+#ifndef FKI_SYM_REG_H
+#define FKI_SYM_REG_H
+
+#include <linux/types.h>
+
+enum fki_sym_id {
+	FKI_SYM_SET_MEMORY_X = 0,
+	FKI_SYM_SET_MEMORY_NX,
+	FKI_SYM_ALLOC_CONTIG,
+	FKI_SYM_FREE_CONTIG,
+	FKI_SYM_CMA_AREA,
+	FKI_SYM_CMA_ALLOC,
+	FKI_SYM_CMA_RELEASE,
+	FKI_SYM_STEXT,
+	FKI_SYM_END,
+	FKI_SYM_KIMAGE_VOFFSET,
+	FKI_SYM_EFI_MEM_TYPE,
+	FKI_SYM_SCHED_HRTIMEOUT,
+	FKI_SYM_FILP_OPEN,
+	FKI_SYM_KERNEL_READ,
+	FKI_SYM_KERNEL_WRITE,
+	FKI_SYM_SWAPPER_PG_DIR,
+	FKI_SYM_SET_SWAPPER_PGD,
+	FKI_SYM_REG_BRK_HOOK,
+	FKI_SYM_UNREG_BRK_HOOK,
+	FKI_SYM_COUNT
+};
+
+enum fki_layout_id {
+	FKI_LAY_PT_REGS_REGS = 0,
+	FKI_LAY_PT_REGS_PC,
+	FKI_LAY_PT_REGS_PSTATE,
+	FKI_LAY_TASK_STACK,
+	FKI_LAY_TASK_MM,
+	FKI_LAY_VMA_START,
+	FKI_LAY_VMA_FLAGS,
+	FKI_LAY_NETDEV_NAME,
+	FKI_LAY_NETDEV_OPS,
+	FKI_LAY_NETDEV_MIN_MTU,
+	FKI_LAY_NETDEV_MAX_MTU,
+	FKI_LAY_NETDEV_STATS,
+	FKI_LAY_NETSTATS_RX_PKTS,
+	FKI_LAY_NETSTATS_RX_BYTES,
+	FKI_LAY_NETSTATS_RX_DROP,
+	FKI_LAY_NETSTATS_TX_PKTS,
+	FKI_LAY_NETSTATS_TX_BYTES,
+	FKI_LAY_NETSTATS_TX_DROP,
+	FKI_LAY_FILE_MAPPING,
+	FKI_LAY_ADDR_HOST,
+	FKI_LAY_INODE_SIZE,
+	FKI_LAY_FW_DATA,
+	FKI_LAY_FW_SIZE,
+	FKI_LAY_COUNT
+};
+
+int fki_sym_init(void);
+void fki_sym_exit(void);
+unsigned long fki_sym_resolve(const char *name);
+unsigned long fki_sym_addr(enum fki_sym_id id);
+
+bool fki_layout_ok(enum fki_layout_id id);
+u32 fki_layout_off(enum fki_layout_id id);
+void *fki_layout_ptr(const void *base, enum fki_layout_id id);
+
+#endif

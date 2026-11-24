@@ -26,6 +26,7 @@
 #include <linux/version.h>
 #include <asm/arch_timer.h>
 #include <asm/barrier.h>
+#include <asm/cpufeature.h>
 #include <asm/cputype.h>
 #include <asm/neon.h>
 #include <asm/sysreg.h>
@@ -49,6 +50,29 @@ struct fki_idle_args {
 
 typedef int (*sched_hrtimeout_fn)(ktime_t *expires, u64 delta_ns,
 				  const enum hrtimer_mode mode);
+typedef void (*schedule_fn)(void);
+typedef signed long (*schedule_timeout_fn)(signed long timeout);
+typedef void (*msleep_fn)(unsigned int msecs);
+typedef int (*set_cpus_allowed_fn)(struct task_struct *p,
+				   const struct cpumask *new_mask);
+typedef struct task_struct *(*kthread_create_node_fn)(int (*threadfn)(void *),
+						      void *data, int node,
+						      const char *namefmt, ...);
+typedef void (*kthread_bind_fn)(struct task_struct *k, unsigned int cpu);
+typedef int (*kthread_stop_fn)(struct task_struct *k);
+typedef bool (*kthread_should_stop_fn)(void);
+typedef int (*wake_up_process_fn)(struct task_struct *p);
+typedef void (*put_task_struct_fn)(struct task_struct *t);
+typedef int (*smp_call_single_fn)(int cpu, smp_call_func_t func, void *info,
+				  int wait);
+typedef int (*smp_call_async_fn)(int cpu, call_single_data_t *csd);
+typedef void (*ktime_get_real_ts64_fn)(struct timespec64 *ts);
+typedef void (*get_random_bytes_fn)(void *buf, size_t len);
+typedef void (*neon_void_fn)(void);
+typedef void (*neon_state_fn)(struct user_fpsimd_state *state);
+typedef struct page *(*alloc_pages_fn)(gfp_t gfp, unsigned int order,
+				       int preferred_nid, nodemask_t *nodemask);
+typedef void (*free_pages_fn)(unsigned long addr, unsigned int order);
 
 static void *g_alt_stack[NR_CPUS];
 static struct task_struct *g_idle_task[NR_CPUS];
@@ -108,17 +132,224 @@ static __always_inline void pac_keys_write(const struct fki_pac_keys *k)
 	isb();
 }
 
-static void fki_fpsimd_forget(void)
+static __nocfi noinline void call_kernel_neon_begin(void)
 {
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
+	neon_state_fn begin_fn;
+	neon_state_fn end_fn;
 	struct user_fpsimd_state scratch;
 
-	kernel_neon_begin(&scratch);
-	kernel_neon_end(&scratch);
+	begin_fn = (neon_state_fn)fki_sym_addr(FKI_SYM_KERNEL_NEON_BEGIN);
+	end_fn = (neon_state_fn)fki_sym_addr(FKI_SYM_KERNEL_NEON_END);
+	if (begin_fn && end_fn) {
+		begin_fn(&scratch);
+		end_fn(&scratch);
+	}
 #else
-	kernel_neon_begin();
-	kernel_neon_end();
+	neon_void_fn begin_fn;
+	neon_void_fn end_fn;
+
+	begin_fn = (neon_void_fn)fki_sym_addr(FKI_SYM_KERNEL_NEON_BEGIN);
+	end_fn = (neon_void_fn)fki_sym_addr(FKI_SYM_KERNEL_NEON_END);
+	if (begin_fn && end_fn) {
+		begin_fn();
+		end_fn();
+	}
 #endif
+}
+
+static __nocfi noinline void call_schedule(void)
+{
+	schedule_fn fn = (schedule_fn)fki_sym_addr(FKI_SYM_SCHEDULE);
+
+	if (fn) {
+		fn();
+	}
+}
+
+static __nocfi noinline signed long call_schedule_timeout(signed long timeout)
+{
+	schedule_timeout_fn fn;
+
+	fn = (schedule_timeout_fn)fki_sym_addr(FKI_SYM_SCHEDULE_TIMEOUT);
+	if (!fn) {
+		return timeout;
+	}
+	return fn(timeout);
+}
+
+static __nocfi noinline void call_msleep(unsigned int ms)
+{
+	msleep_fn fn = (msleep_fn)fki_sym_addr(FKI_SYM_MSLEEP);
+
+	if (fn) {
+		fn(ms);
+	}
+}
+
+static __nocfi noinline int call_set_cpus_allowed(struct task_struct *task,
+						  const struct cpumask *mask)
+{
+	set_cpus_allowed_fn fn;
+
+	fn = (set_cpus_allowed_fn)fki_sym_addr(FKI_SYM_SET_CPUS_ALLOWED);
+	if (!fn) {
+		return -ENODEV;
+	}
+	return fn(task, mask);
+}
+
+static __nocfi noinline struct task_struct *call_kthread_create(
+	int (*fn_entry)(void *), void *arg, const char *name)
+{
+	kthread_create_node_fn fn;
+
+	fn = (kthread_create_node_fn)fki_sym_addr(FKI_SYM_KTHREAD_CREATE_NODE);
+	if (!fn) {
+		return ERR_PTR(-ENODEV);
+	}
+	return fn(fn_entry, arg, NUMA_NO_NODE, "%s", name);
+}
+
+static __nocfi noinline void call_kthread_bind(struct task_struct *task,
+					       unsigned int cpu)
+{
+	kthread_bind_fn fn = (kthread_bind_fn)fki_sym_addr(FKI_SYM_KTHREAD_BIND);
+
+	if (fn) {
+		fn(task, cpu);
+	}
+}
+
+static __nocfi noinline int call_kthread_stop(struct task_struct *task)
+{
+	kthread_stop_fn fn = (kthread_stop_fn)fki_sym_addr(FKI_SYM_KTHREAD_STOP);
+
+	if (!fn) {
+		return -ENODEV;
+	}
+	return fn(task);
+}
+
+static __nocfi noinline bool call_kthread_should_stop(void)
+{
+	kthread_should_stop_fn fn;
+
+	fn = (kthread_should_stop_fn)fki_sym_addr(FKI_SYM_KTHREAD_SHOULD_STOP);
+	if (!fn) {
+		return false;
+	}
+	return fn();
+}
+
+static __nocfi noinline int call_wake_up_process(struct task_struct *task)
+{
+	wake_up_process_fn fn;
+
+	fn = (wake_up_process_fn)fki_sym_addr(FKI_SYM_WAKE_UP_PROCESS);
+	if (!fn) {
+		return 0;
+	}
+	return fn(task);
+}
+
+static __nocfi noinline void call_put_task_struct(struct task_struct *task)
+{
+	put_task_struct_fn fn;
+
+	fn = (put_task_struct_fn)fki_sym_addr(FKI_SYM_PUT_TASK_STRUCT);
+	if (fn) {
+		fn(task);
+	}
+}
+
+static __nocfi noinline int call_smp_single(int cpu, smp_call_func_t func,
+					    void *info, int wait)
+{
+	smp_call_single_fn fn;
+
+	fn = (smp_call_single_fn)fki_sym_addr(FKI_SYM_SMP_CALL_SINGLE);
+	if (!fn) {
+		return -ENODEV;
+	}
+	return fn(cpu, func, info, wait);
+}
+
+static __nocfi noinline int call_smp_async(int cpu, call_single_data_t *csd)
+{
+	smp_call_async_fn fn = (smp_call_async_fn)fki_sym_addr(FKI_SYM_SMP_CALL_ASYNC);
+
+	if (!fn) {
+		return -ENODEV;
+	}
+	return fn(cpu, csd);
+}
+
+static __nocfi noinline void call_ktime_get_real_ts64(struct timespec64 *ts)
+{
+	ktime_get_real_ts64_fn fn;
+
+	fn = (ktime_get_real_ts64_fn)fki_sym_addr(FKI_SYM_KTIME_GET_REAL_TS64);
+	if (fn) {
+		fn(ts);
+	} else {
+		ts->tv_sec = 0;
+		ts->tv_nsec = 0;
+	}
+}
+
+static __nocfi noinline void call_get_random_bytes(void *buf, size_t len)
+{
+	get_random_bytes_fn fn;
+
+	fn = (get_random_bytes_fn)fki_sym_addr(FKI_SYM_GET_RANDOM_BYTES);
+	if (fn) {
+		fn(buf, len);
+	}
+}
+
+static __nocfi noinline struct page *call_alloc_pages(gfp_t gfp,
+						      unsigned int order)
+{
+	alloc_pages_fn fn = (alloc_pages_fn)fki_sym_addr(FKI_SYM_ALLOC_PAGES);
+
+	if (!fn) {
+		return NULL;
+	}
+	return fn(gfp, order, numa_node_id(), NULL);
+}
+
+static __nocfi noinline void call_free_pages(unsigned long addr,
+					     unsigned int order)
+{
+	free_pages_fn fn = (free_pages_fn)fki_sym_addr(FKI_SYM_FREE_PAGES);
+
+	if (fn) {
+		fn(addr, order);
+	}
+}
+
+static void fki_task_ref_get(struct task_struct *task)
+{
+	atomic_t *usage = (atomic_t *)fki_layout_ptr(task, FKI_LAY_TASK_USAGE);
+
+	if (usage) {
+		atomic_inc(usage);
+	}
+}
+
+static void fki_task_ref_put(struct task_struct *task)
+{
+	atomic_t *usage = (atomic_t *)fki_layout_ptr(task, FKI_LAY_TASK_USAGE);
+
+	if (usage && atomic_dec_and_test(usage)) {
+		call_put_task_struct(task);
+	}
+}
+
+static void fki_fpsimd_forget(void)
+{
+	call_kernel_neon_begin();
 }
 
 __attribute__((target("branch-protection=none")))
@@ -210,7 +441,7 @@ void fki_wake_idle_cpu(int cpu)
 	}
 	task = READ_ONCE(g_idle_task[cpu]);
 	if (task) {
-		wake_up_process(task);
+		call_wake_up_process(task);
 	}
 }
 
@@ -221,7 +452,7 @@ static __nocfi noinline int call_sched_hrtimeout(ktime_t *expires, u64 delta_ns,
 
 	fn = (sched_hrtimeout_fn)fki_sym_addr(FKI_SYM_SCHED_HRTIMEOUT);
 	if (!fn) {
-		return schedule_timeout(msecs_to_jiffies(1));
+		return call_schedule_timeout(msecs_to_jiffies(1));
 	}
 	return fn(expires, delta_ns, mode);
 }
@@ -297,13 +528,12 @@ void fki_kick_cpu(int cpu)
 	smp_mb();
 	task = READ_ONCE(g_idle_task[cpu]);
 	if (task) {
-		wake_up_process(task);
+		call_wake_up_process(task);
 		return;
 	}
 	if (cpu != smp_processor_id() &&
 	    atomic_cmpxchg_acquire(&g_kick_claimed[cpu], 0, 1) == 0) {
-		if (smp_call_function_single_async(cpu,
-						   per_cpu_ptr(&g_kick_csd, cpu))) {
+		if (call_smp_async(cpu, per_cpu_ptr(&g_kick_csd, cpu))) {
 			atomic_set_release(&g_kick_claimed[cpu], 0);
 		}
 	}
@@ -323,7 +553,7 @@ int fki_cpu_mpidr(int cpu, fki_u64 *mpidr)
 	if (cpu < 0 || cpu >= nr_cpu_ids || !cpu_online(cpu) || !mpidr) {
 		return -EINVAL;
 	}
-	err = smp_call_function_single(cpu, fki_read_mpidr, &val, 1);
+	err = call_smp_single(cpu, fki_read_mpidr, &val, 1);
 	*mpidr = val;
 	return err;
 }
@@ -340,7 +570,7 @@ int fki_bind_cpu(int cpu)
 	if (cpu < 0 || cpu >= nr_cpu_ids || !cpu_online(cpu)) {
 		return -EINVAL;
 	}
-	return set_cpus_allowed_ptr(current, cpumask_of(cpu));
+	return call_set_cpus_allowed(current, cpumask_of(cpu));
 }
 EXPORT_SYMBOL(fki_bind_cpu);
 
@@ -348,16 +578,17 @@ void *fki_thread_start(int (*fn)(void *), void *arg, int cpu, const char *name)
 {
 	struct task_struct *task;
 
-	if (!fn || cpu < 0 || cpu >= nr_cpu_ids || !cpu_online(cpu)) {
+	if (!fn || cpu < 0 || cpu >= nr_cpu_ids || !cpu_online(cpu) ||
+	    !fki_layout_ok(FKI_LAY_TASK_USAGE)) {
 		return NULL;
 	}
-	task = kthread_create(fn, arg, "%s", name ? name : "fki");
+	task = call_kthread_create(fn, arg, name ? name : "fki");
 	if (IS_ERR(task)) {
 		return NULL;
 	}
-	kthread_bind(task, cpu);
-	get_task_struct(task);
-	wake_up_process(task);
+	call_kthread_bind(task, cpu);
+	fki_task_ref_get(task);
+	call_wake_up_process(task);
 	return task;
 }
 EXPORT_SYMBOL(fki_thread_start);
@@ -365,15 +596,15 @@ EXPORT_SYMBOL(fki_thread_start);
 void fki_thread_stop(void *thread)
 {
 	if (thread) {
-		kthread_stop(thread);
-		put_task_struct(thread);
+		call_kthread_stop(thread);
+		fki_task_ref_put(thread);
 	}
 }
 EXPORT_SYMBOL(fki_thread_stop);
 
 int fki_thread_should_stop(void)
 {
-	return kthread_should_stop();
+	return call_kthread_should_stop();
 }
 EXPORT_SYMBOL(fki_thread_should_stop);
 
@@ -381,10 +612,10 @@ void fki_thread_wait(const volatile unsigned long *flag)
 {
 	for (;;) {
 		set_current_state(TASK_INTERRUPTIBLE);
-		if (READ_ONCE(*flag) || kthread_should_stop()) {
+		if (READ_ONCE(*flag) || call_kthread_should_stop()) {
 			break;
 		}
-		schedule();
+		call_schedule();
 	}
 	__set_current_state(TASK_RUNNING);
 }
@@ -393,14 +624,14 @@ EXPORT_SYMBOL(fki_thread_wait);
 void fki_thread_wake(void *thread)
 {
 	if (thread) {
-		wake_up_process(thread);
+		call_wake_up_process(thread);
 	}
 }
 EXPORT_SYMBOL(fki_thread_wake);
 
 void fki_msleep(unsigned int ms)
 {
-	msleep(ms);
+	call_msleep(ms);
 }
 EXPORT_SYMBOL(fki_msleep);
 
@@ -420,7 +651,7 @@ void fki_realtime(fki_u64 *sec, fki_u64 *nsec)
 {
 	struct timespec64 ts;
 
-	ktime_get_real_ts64(&ts);
+	call_ktime_get_real_ts64(&ts);
 	if (sec) {
 		*sec = ts.tv_sec;
 	}
@@ -432,7 +663,7 @@ EXPORT_SYMBOL(fki_realtime);
 
 void fki_random(void *buf, unsigned long len)
 {
-	get_random_bytes(buf, len);
+	call_get_random_bytes(buf, len);
 }
 EXPORT_SYMBOL(fki_random);
 
@@ -442,8 +673,8 @@ static void fki_free_alt_stacks(void)
 
 	for_each_possible_cpu(cpu) {
 		if (g_alt_stack[cpu]) {
-			free_pages((unsigned long)g_alt_stack[cpu],
-				   FKI_ALT_STACK_ORDER);
+			call_free_pages((unsigned long)g_alt_stack[cpu],
+					FKI_ALT_STACK_ORDER);
 			g_alt_stack[cpu] = NULL;
 		}
 	}
@@ -453,13 +684,15 @@ int fki_cpu_init(void)
 {
 	int cpu;
 
-	if (!fki_layout_ok(FKI_LAY_TASK_STACK)) {
-		pr_err("[fki] task_struct.stack layout unavailable\n");
+	if (!fki_layout_ok(FKI_LAY_TASK_STACK) ||
+	    !fki_layout_ok(FKI_LAY_TASK_USAGE)) {
+		pr_err("[fki] task_struct layout unavailable\n");
 		return -ENOTSUPP;
 	}
 
 	for_each_possible_cpu(cpu) {
-		struct page *pg = alloc_pages(GFP_KERNEL, FKI_ALT_STACK_ORDER);
+		struct page *pg = call_alloc_pages(GFP_KERNEL,
+						   FKI_ALT_STACK_ORDER);
 		call_single_data_t *csd;
 
 		if (!pg) {
@@ -483,3 +716,13 @@ void fki_cpu_exit(void)
 {
 	fki_free_alt_stacks();
 }
+
+int fki_has_s1pie(void)
+{
+#ifdef ARM64_HAS_S1PIE
+	return cpus_have_cap(ARM64_HAS_S1PIE) ? 1 : 0;
+#else
+	return 0;
+#endif
+}
+EXPORT_SYMBOL(fki_has_s1pie);

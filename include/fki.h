@@ -84,6 +84,7 @@ int fki_bind_cpu(int cpu);
 int fki_num_cpus(void);
 int fki_cpu_mpidr(int cpu, fki_u64 *mpidr);
 void fki_kick_cpu(int cpu);
+int fki_has_s1pie(void);
 
 void *fki_thread_start(int (*fn)(void *), void *arg, int cpu, const char *name);
 void fki_thread_stop(void *thread);

@@ -32,6 +32,9 @@
 struct cma;
 
 typedef int (*set_memory_fn)(unsigned long addr, int numpages);
+typedef void *(*vzalloc_fn)(unsigned long size);
+typedef void (*vfree_fn)(const void *addr);
+typedef struct page *(*vmalloc_to_page_fn)(const void *vmalloc_addr);
 typedef struct page *(*alloc_contig_fn)(unsigned long nr_pages, gfp_t gfp,
 					int nid, nodemask_t *nodemask);
 typedef void (*free_contig_fn)(unsigned long pfn, unsigned long nr_pages);
@@ -40,6 +43,11 @@ typedef struct page *(*cma_alloc_fn)(struct cma *cma, unsigned long count,
 typedef bool (*cma_release_fn)(struct cma *cma, const struct page *pages,
 			       unsigned long count);
 typedef int (*efi_mem_type_fn)(unsigned long phys_addr);
+typedef int (*region_intersects_fn)(resource_size_t offset, size_t size,
+				    unsigned long flags, unsigned long desc);
+typedef void *(*memremap_fn)(resource_size_t offset, size_t size,
+			     unsigned long flags);
+typedef void (*memunmap_fn)(void *addr);
 typedef void (*set_swapper_pgd_fn)(pgd_t *pgdp, pgd_t pgd);
 
 static unsigned long carve_base;
@@ -139,26 +147,96 @@ static __nocfi noinline int call_efi_mem_type(unsigned long phys)
 	return fn(phys);
 }
 
+static __nocfi noinline void *call_vzalloc(unsigned long size)
+{
+	vzalloc_fn fn = (vzalloc_fn)fki_sym_addr(FKI_SYM_VZALLOC);
+
+	if (!fn) {
+		return NULL;
+	}
+	return fn(size);
+}
+
+static __nocfi noinline void call_vfree(const void *addr)
+{
+	vfree_fn fn = (vfree_fn)fki_sym_addr(FKI_SYM_VFREE);
+
+	if (fn) {
+		fn(addr);
+	}
+}
+
+static __nocfi noinline struct page *call_vmalloc_to_page(const void *addr)
+{
+	vmalloc_to_page_fn fn;
+
+	fn = (vmalloc_to_page_fn)fki_sym_addr(FKI_SYM_VMALLOC_TO_PAGE);
+	if (!fn) {
+		return NULL;
+	}
+	return fn(addr);
+}
+
+static __nocfi noinline int call_region_intersects(resource_size_t offset,
+						   size_t size,
+						   unsigned long flags,
+						   unsigned long desc)
+{
+	region_intersects_fn fn;
+
+	fn = (region_intersects_fn)fki_sym_addr(FKI_SYM_REGION_INTERSECTS);
+	if (!fn) {
+		return REGION_MIXED;
+	}
+	return fn(offset, size, flags, desc);
+}
+
+static __nocfi noinline void *call_memremap(resource_size_t offset,
+					    size_t size, unsigned long flags)
+{
+	memremap_fn fn = (memremap_fn)fki_sym_addr(FKI_SYM_MEMREMAP);
+
+	if (!fn) {
+		return NULL;
+	}
+	return fn(offset, size, flags);
+}
+
+static __nocfi noinline void call_memunmap(void *addr)
+{
+	memunmap_fn fn = (memunmap_fn)fki_sym_addr(FKI_SYM_MEMUNMAP);
+
+	if (fn) {
+		fn(addr);
+	}
+}
+
 int fki_region_alloc(unsigned long size, struct fki_region *region)
 {
 	unsigned long nr_pages = PAGE_ALIGN(size) >> PAGE_SHIFT;
+	struct page *pg;
 	void *va;
 	int err;
 
 	if (!region || !nr_pages) {
 		return -EINVAL;
 	}
-	va = vzalloc(nr_pages << PAGE_SHIFT);
+	va = call_vzalloc(nr_pages << PAGE_SHIFT);
 	if (!va) {
 		return -ENOMEM;
 	}
+	pg = call_vmalloc_to_page(va);
+	if (!pg) {
+		call_vfree(va);
+		return -EFAULT;
+	}
 	err = call_set_memory_x((unsigned long)va, (int)nr_pages);
 	if (err) {
-		vfree(va);
+		call_vfree(va);
 		return err;
 	}
 	region->va = va;
-	region->pa = page_to_phys(vmalloc_to_page(va));
+	region->pa = page_to_phys(pg);
 	region->size = nr_pages << PAGE_SHIFT;
 	region->handle = NULL;
 	return 0;
@@ -172,7 +250,7 @@ void fki_region_free(struct fki_region *region)
 	}
 	call_set_memory_nx((unsigned long)region->va,
 			   (int)(region->size >> PAGE_SHIFT));
-	vfree(region->va);
+	call_vfree(region->va);
 	region->va = NULL;
 }
 EXPORT_SYMBOL(fki_region_free);
@@ -218,14 +296,14 @@ static int fki_carve_check(unsigned long base, unsigned long len)
 		}
 	}
 
-	if (region_intersects(base, len, IORESOURCE_SYSTEM_RAM,
-			      IORES_DESC_NONE) != REGION_DISJOINT) {
+	if (call_region_intersects(base, len, IORESOURCE_SYSTEM_RAM,
+				   IORES_DESC_NONE) != REGION_DISJOINT) {
 		pr_err("[fki] carve [%#lx, %#lx) overlaps IORESOURCE_SYSTEM_RAM\n",
 		       base, end);
 		return -EBUSY;
 	}
-	if (region_intersects(base, len, IORESOURCE_MEM,
-			      IORES_DESC_NONE) != REGION_DISJOINT) {
+	if (call_region_intersects(base, len, IORESOURCE_MEM,
+				   IORES_DESC_NONE) != REGION_DISJOINT) {
 		pr_err("[fki] carve [%#lx, %#lx) overlaps IORESOURCE_MEM\n",
 		       base, end);
 		return -EBUSY;
@@ -253,7 +331,7 @@ int fki_contig_alloc(unsigned long size, struct fki_region *region)
 		if (err) {
 			return err;
 		}
-		va = memremap(carve_base, clen, MEMREMAP_WB);
+		va = call_memremap(carve_base, clen, MEMREMAP_WB);
 		if (va) {
 			g_carve_used = true;
 			region->va = va;
@@ -317,7 +395,7 @@ void fki_contig_free(struct fki_region *region)
 		return;
 	}
 	if ((unsigned long)region->handle == 4UL) {
-		memunmap(region->va);
+		call_memunmap(region->va);
 		g_carve_used = false;
 		return;
 	}

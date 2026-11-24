@@ -363,6 +363,12 @@ static struct boot_args_v2 *build_boot(unsigned char *base_va, u64_t phys,
 		x_memcpy(ba->command_line + x_strlen(ba->command_line), pg,
 			 x_strlen(pg) + 1);
 	}
+	if (fki_has_s1pie()) {
+		const char *s1pie = " linux64_s1pie=1";
+
+		x_memcpy(ba->command_line + x_strlen(ba->command_line), s1pie,
+			 x_strlen(s1pie) + 1);
+	}
 	if (g_xnu.rd_size || g_xnu.hd_file) {
 		const char *rd = " rd=md0";
 

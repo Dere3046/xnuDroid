@@ -47,6 +47,31 @@ struct hc_call {
 	long result;
 };
 
+typedef void *(*vzalloc_fn)(unsigned long size);
+typedef void (*vfree_fn)(const void *addr);
+typedef int (*misc_register_fn)(struct miscdevice *misc);
+typedef void (*misc_deregister_fn)(struct miscdevice *misc);
+typedef void (*rwsem_op_fn)(void *sem);
+typedef struct vm_area_struct *(*find_vma_fn)(struct mm_struct *mm,
+					      unsigned long addr);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+typedef int (*follow_pfnmap_start_fn)(struct follow_pfnmap_args *args);
+typedef void (*follow_pfnmap_end_fn)(struct follow_pfnmap_args *args);
+#endif
+typedef int (*follow_pfn_fn)(struct vm_area_struct *vma, unsigned long address,
+			     unsigned long *pfn);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 5, 0)
+typedef long (*gup_remote_fn)(struct mm_struct *mm, unsigned long start,
+			      unsigned long nr_pages, unsigned int gup_flags,
+			      struct page **pages, int *locked);
+#else
+typedef long (*gup_remote_fn)(struct mm_struct *mm, unsigned long start,
+			      unsigned long nr_pages, unsigned int gup_flags,
+			      struct page **pages,
+			      struct vm_area_struct **vmas, int *locked);
+#endif
+typedef void (*put_page_fn)(void *obj);
+
 static DECLARE_WAIT_QUEUE_HEAD(g_hc_req_wait);
 static DECLARE_WAIT_QUEUE_HEAD(g_hc_done_wait);
 static DEFINE_SPINLOCK(g_hc_lock);
@@ -57,6 +82,138 @@ static u64 g_hc_seq;
 static int g_hc_state;
 static long g_hc_result;
 static int g_hc_open;
+static bool g_hc_registered;
+
+static __nocfi noinline void *call_vzalloc(unsigned long size)
+{
+	vzalloc_fn fn = (vzalloc_fn)fki_sym_addr(FKI_SYM_VZALLOC);
+
+	if (!fn) {
+		return NULL;
+	}
+	return fn(size);
+}
+
+static __nocfi noinline void call_vfree(const void *addr)
+{
+	vfree_fn fn = (vfree_fn)fki_sym_addr(FKI_SYM_VFREE);
+
+	if (fn) {
+		fn(addr);
+	}
+}
+
+static __nocfi noinline int call_misc_register(struct miscdevice *misc)
+{
+	misc_register_fn fn;
+
+	fn = (misc_register_fn)fki_sym_addr(FKI_SYM_MISC_REGISTER);
+	if (!fn) {
+		return -ENODEV;
+	}
+	return fn(misc);
+}
+
+static __nocfi noinline void call_misc_deregister(struct miscdevice *misc)
+{
+	misc_deregister_fn fn;
+
+	fn = (misc_deregister_fn)fki_sym_addr(FKI_SYM_MISC_DEREGISTER);
+	if (fn) {
+		fn(misc);
+	}
+}
+
+static __nocfi noinline void call_down_read(void *sem)
+{
+	rwsem_op_fn fn = (rwsem_op_fn)fki_sym_addr(FKI_SYM_DOWN_READ);
+
+	if (fn) {
+		fn(sem);
+	}
+}
+
+static __nocfi noinline void call_up_read(void *sem)
+{
+	rwsem_op_fn fn = (rwsem_op_fn)fki_sym_addr(FKI_SYM_UP_READ);
+
+	if (fn) {
+		fn(sem);
+	}
+}
+
+static __nocfi noinline struct vm_area_struct *call_find_vma(
+	struct mm_struct *mm, unsigned long addr)
+{
+	find_vma_fn fn = (find_vma_fn)fki_sym_addr(FKI_SYM_FIND_VMA);
+
+	if (!fn) {
+		return NULL;
+	}
+	return fn(mm, addr);
+}
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+static __nocfi noinline int call_follow_pfnmap_start(
+	struct follow_pfnmap_args *args)
+{
+	follow_pfnmap_start_fn fn;
+
+	fn = (follow_pfnmap_start_fn)fki_sym_addr(FKI_SYM_FOLLOW_PFNMAP_START);
+	if (!fn) {
+		return -ENOTSUPP;
+	}
+	return fn(args);
+}
+
+static __nocfi noinline void call_follow_pfnmap_end(
+	struct follow_pfnmap_args *args)
+{
+	follow_pfnmap_end_fn fn;
+
+	fn = (follow_pfnmap_end_fn)fki_sym_addr(FKI_SYM_FOLLOW_PFNMAP_END);
+	if (fn) {
+		fn(args);
+	}
+}
+#endif
+
+static __nocfi noinline int call_follow_pfn(struct vm_area_struct *vma,
+					    unsigned long addr,
+					    unsigned long *pfn)
+{
+	follow_pfn_fn fn = (follow_pfn_fn)fki_sym_addr(FKI_SYM_FOLLOW_PFN);
+
+	if (!fn) {
+		return -ENOTSUPP;
+	}
+	return fn(vma, addr, pfn);
+}
+
+static __nocfi noinline long call_gup_remote(struct mm_struct *mm,
+					     unsigned long va,
+					     struct page **pg)
+{
+	gup_remote_fn fn = (gup_remote_fn)fki_sym_addr(FKI_SYM_GUP_REMOTE);
+
+	if (!fn) {
+		return -ENOTSUPP;
+	}
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 5, 0)
+	return fn(mm, va, 1, FOLL_WRITE, pg, NULL);
+#else
+	return fn(mm, va, 1, FOLL_WRITE, pg, NULL, NULL);
+#endif
+}
+
+static __nocfi noinline void call_put_page(struct page *pg)
+{
+	put_page_fn fn = (put_page_fn)fki_sym_addr(FKI_SYM_PUT_PAGE);
+
+	if (fn) {
+		fn(compound_head(pg));
+	}
+}
 
 static void hc_call_body(void *ptr)
 {
@@ -68,7 +225,7 @@ static void hc_call_body(void *ptr)
 	preempt_enable();
 	mutex_lock(&g_hc_mutex);
 	if (!g_hc_buf) {
-		g_hc_buf = kvmalloc(HC_MAX, GFP_KERNEL);
+		g_hc_buf = call_vzalloc(HC_MAX);
 	}
 	if (!g_hc_buf || call->len > HC_MAX) {
 		ret = g_hc_buf ? -EMSGSIZE : -ENOMEM;
@@ -202,10 +359,7 @@ static ssize_t hc_write(struct file *f, const char __user *buf, size_t n,
 static struct vm_area_struct *hc_find_vma(struct mm_struct *mm,
 					  unsigned long va)
 {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 13, 0)
-	return vma_lookup(mm, va);
-#else
-	struct vm_area_struct *vma = find_vma(mm, va);
+	struct vm_area_struct *vma = call_find_vma(mm, va);
 	unsigned long *vm_start;
 
 	if (!vma) {
@@ -216,41 +370,35 @@ static struct vm_area_struct *hc_find_vma(struct mm_struct *mm,
 		return NULL;
 	}
 	return vma;
-#endif
 }
 
 static long hc_xlate_pfnmap(struct vm_area_struct *vma, unsigned long va,
 			    u64 *pa)
 {
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
-	struct follow_pfnmap_args args = { .vma = vma, .address = va };
-	int err = follow_pfnmap_start(&args);
+	if (fki_sym_addr(FKI_SYM_FOLLOW_PFNMAP_START) &&
+	    fki_sym_addr(FKI_SYM_FOLLOW_PFNMAP_END)) {
+		struct follow_pfnmap_args args = { .vma = vma, .address = va };
+		int err = call_follow_pfnmap_start(&args);
 
-	if (err) {
-		return err;
+		if (err) {
+			return err;
+		}
+		*pa = (u64)args.pfn << PAGE_SHIFT;
+		call_follow_pfnmap_end(&args);
+		return 0;
 	}
-	*pa = (u64)args.pfn << PAGE_SHIFT;
-	follow_pfnmap_end(&args);
-	return 0;
-#else
-	unsigned long pfn = 0;
-	int err = follow_pfn(vma, va, &pfn);
+#endif
+	{
+		unsigned long pfn = 0;
+		int err = call_follow_pfn(vma, va, &pfn);
 
-	if (err) {
-		return err;
+		if (err) {
+			return err;
+		}
+		*pa = (u64)pfn << PAGE_SHIFT;
+		return 0;
 	}
-	*pa = (u64)pfn << PAGE_SHIFT;
-	return 0;
-#endif
-}
-
-static long hc_gup_one(struct mm_struct *mm, unsigned long va, struct page **pg)
-{
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 5, 0)
-	return get_user_pages_remote(mm, va, 1, FOLL_WRITE, pg, NULL);
-#else
-	return get_user_pages_remote(mm, va, 1, FOLL_WRITE, pg, NULL, NULL);
-#endif
 }
 
 static long hc_xlate_one(struct mm_struct *mm, unsigned long va, u64 *pa)
@@ -269,11 +417,11 @@ static long hc_xlate_one(struct mm_struct *mm, unsigned long va, u64 *pa)
 	if (*vm_flags & (VM_IO | VM_PFNMAP)) {
 		return hc_xlate_pfnmap(vma, va, pa);
 	}
-	if (hc_gup_one(mm, va, &pg) != 1) {
+	if (call_gup_remote(mm, va, &pg) != 1) {
 		return -EFAULT;
 	}
 	*pa = page_to_phys(pg);
-	put_page(pg);
+	call_put_page(pg);
 	return 0;
 }
 
@@ -282,12 +430,18 @@ static long hc_xlate(struct xnu_hostcall_xlate __user *ua)
 	struct xnu_hostcall_xlate req;
 	struct mm_struct **mm_ptr;
 	struct mm_struct *mm;
+	void *mmap_lock;
 	unsigned long i;
 	unsigned long nr_pages;
 	long err = 0;
 
 	if (!fki_layout_ok(FKI_LAY_TASK_MM) ||
-	    !fki_layout_ok(FKI_LAY_VMA_FLAGS)) {
+	    !fki_layout_ok(FKI_LAY_MM_LOCK) ||
+	    !fki_layout_ok(FKI_LAY_VMA_START) ||
+	    !fki_layout_ok(FKI_LAY_VMA_FLAGS) ||
+	    !fki_sym_addr(FKI_SYM_DOWN_READ) ||
+	    !fki_sym_addr(FKI_SYM_UP_READ) ||
+	    !fki_sym_addr(FKI_SYM_FIND_VMA)) {
 		return -ENOTSUPP;
 	}
 	mm_ptr = (struct mm_struct **)fki_layout_ptr(current, FKI_LAY_TASK_MM);
@@ -295,6 +449,10 @@ static long hc_xlate(struct xnu_hostcall_xlate __user *ua)
 		return -EINVAL;
 	}
 	mm = *mm_ptr;
+	mmap_lock = fki_layout_ptr(mm, FKI_LAY_MM_LOCK);
+	if (!mmap_lock) {
+		return -ENOTSUPP;
+	}
 
 	if (copy_from_user(&req, ua, sizeof(req))) {
 		return -EFAULT;
@@ -306,7 +464,7 @@ static long hc_xlate(struct xnu_hostcall_xlate __user *ua)
 	if (nr_pages > req.max) {
 		return -E2BIG;
 	}
-	mmap_read_lock(mm);
+	call_down_read(mmap_lock);
 	for (i = 0; i < nr_pages && !err; i++) {
 		u64 pa = 0;
 
@@ -315,7 +473,7 @@ static long hc_xlate(struct xnu_hostcall_xlate __user *ua)
 			err = -EFAULT;
 		}
 	}
-	mmap_read_unlock(mm);
+	call_up_read(mmap_lock);
 	return err;
 }
 
@@ -344,14 +502,13 @@ static int hc_dev_release(struct inode *i, struct file *f)
 	return 0;
 }
 
-static const struct file_operations g_hc_fops = {
+static struct file_operations g_hc_fops = {
 	.owner = THIS_MODULE,
 	.open = hc_dev_open,
 	.release = hc_dev_release,
 	.read = hc_read,
 	.write = hc_write,
 	.unlocked_ioctl = hc_ioctl,
-	.llseek = noop_llseek,
 };
 
 static struct miscdevice g_hc_dev = {
@@ -363,12 +520,22 @@ static struct miscdevice g_hc_dev = {
 
 int fki_hostcall_init(void)
 {
-	return misc_register(&g_hc_dev);
+	int err;
+
+	g_hc_fops.llseek = (void *)fki_sym_addr(FKI_SYM_NOOP_LLSEEK);
+	err = call_misc_register(&g_hc_dev);
+	if (!err) {
+		g_hc_registered = true;
+	}
+	return err;
 }
 
 void fki_hostcall_exit(void)
 {
-	misc_deregister(&g_hc_dev);
-	kvfree(g_hc_buf);
+	if (g_hc_registered) {
+		call_misc_deregister(&g_hc_dev);
+		g_hc_registered = false;
+	}
+	call_vfree(g_hc_buf);
 	g_hc_buf = NULL;
 }

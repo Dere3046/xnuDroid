@@ -176,7 +176,8 @@ int xnu_enter_arm_init(struct boot_args_v2 *ba)
 
 	__asm__ volatile("mrs %0, tcr_el1" : "=r"(tcr));
 	__asm__ volatile("mrs %0, ttbr0_el1" : "=r"(ttbr0));
-	xnu_W.xnu_tcr = tcr & ~(1ULL << 22);
+	/* User pmaps walk 47 bits from L0 with 4 KiB pages (T0SZ_HW=17) */
+	xnu_W.xnu_tcr = (tcr & ~(1ULL << 22) & ~0x3fULL & ~(3ULL << 14)) | 17ULL;
 	xnu_W.xnu_ttbr0 = ttbr0;
 
 	g_xnu.cpu_entry = macho_sym(&g_xnu.img, "_linux64_cpu_entry");

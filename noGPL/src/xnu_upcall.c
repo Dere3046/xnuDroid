@@ -53,6 +53,15 @@ static void handle_console_write(unsigned long a1, unsigned long a2)
 	const char *buf = (const char *)a1;
 	unsigned long i;
 
+	if (buf && a2) {
+		fki_console_write(buf, a2);
+	}
+
+	if (fki_console_open_count() > 0) {
+		line_len = 0;
+		return;
+	}
+
 	for (i = 0; buf && i < a2; i++) {
 		char ch = buf[i];
 
@@ -186,21 +195,25 @@ static long xnu_hook_body(unsigned long call, unsigned long a1,
 {
 	if (call == LINUX64_CALL_CONSOLE_READ) {
 		struct linux64_buf_req *req = (struct linux64_buf_req *)a1;
+		long got = 0;
 
 		if (!req) {
 			return 0;
 		}
-		req->result = 0;
-		if (g_xnu.ci_file) {
-			long got = fki_file_rw(g_xnu.ci_file, 0, req->buf,
-					       (unsigned long)req->len,
-					       g_xnu.ci_off);
+		if (req->buf && req->len > 0) {
+			got = fki_console_read(req->buf,
+					       (unsigned long)req->len);
+		}
+		if (got == 0 && g_xnu.ci_file) {
+			got = fki_file_rw(g_xnu.ci_file, 0, req->buf,
+					  (unsigned long)req->len,
+					  g_xnu.ci_off);
 
 			if (got > 0) {
 				g_xnu.ci_off += got;
-				req->result = got;
 			}
 		}
+		req->result = got > 0 ? got : 0;
 		return 0;
 	}
 

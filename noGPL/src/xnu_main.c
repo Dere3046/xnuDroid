@@ -125,13 +125,14 @@ int xnu_enter_arm_init(struct boot_args_v2 *ba)
 	u64_t a_init;
 	u64_t a_hook;
 	u64_t a_slide;
+	u64_t a_pmap;
 	unsigned long long tcr;
 	unsigned long long ttbr0;
 	int cpu;
 	int slot_idx;
 	long ret;
 
-	if (g_xnu.img.filetype == MH_FILESET && !g_xnu.img.slide) {
+	if (g_xnu.img.filetype == MH_FILESET) {
 		xnu_logs("xnu: kernel collection mode");
 	} else {
 		struct fki_pac_keys saved;
@@ -159,6 +160,23 @@ int xnu_enter_arm_init(struct boot_args_v2 *ba)
 	}
 	*(u64_t *)a_hook = (u64_t)xnu_world_upcall;
 	*(u64_t *)a_slide = g_xnu.img.slide;
+	if (g_xnu.mode == 4) {
+		struct linux64_phys_map *pm;
+
+		a_pmap = macho_sym(&g_xnu.img, "_linux64_phys_map");
+		if (!a_pmap) {
+			xnu_logs("xnu: linux64_phys_map missing (rebuild XNU for mode 4)");
+			return -2;
+		}
+		pm = (struct linux64_phys_map *)a_pmap;
+		pm->gpa_base = g_xnu.m4_gpa_base;
+		pm->gpa_end = g_xnu.m4_gpa_base +
+			      ((u64_t)g_xnu.m4_n_chunks << LINUX64_CHUNK_SHIFT);
+		pm->g2h = (const __UINT32_TYPE__ *)g_xnu.m4_g2h;
+		pm->h2g = g_xnu.m4_h2g;
+		pm->n_chunks = g_xnu.m4_n_chunks;
+		pm->hash_mask = g_xnu.m4_hash_mask;
+	}
 
 	g_xnu.diag_va[0] = a_init;
 	g_xnu.diag_va[1] = g_xnu.img.vmlow;
@@ -231,6 +249,90 @@ int xnu_enter_arm_init(struct boot_args_v2 *ba)
 	return 0;
 }
 
+static void xnu_cleanup(void)
+{
+	if (g_xnu.window_l1) {
+		int i;
+
+		for (i = 0; i < 512; i++) {
+			if (g_xnu.window_owned[i]) {
+				fki_window_set(&g_xnu.window_l1[i], 0);
+				g_xnu.window_owned[i] = 0;
+			}
+		}
+		g_xnu.window_l1 = 0;
+	}
+	if (g_xnu.mode == 4) {
+		if (g_xnu.m4_l3pages) {
+			unsigned int ti;
+
+			for (ti = 0; ti < g_xnu.m4_n_l3; ti++) {
+				if (g_xnu.m4_l3pages[ti].va) {
+					fki_contig_free(&g_xnu.m4_l3pages[ti]);
+					g_xnu.m4_l3pages[ti].va = 0;
+				}
+			}
+			fki_vfree(g_xnu.m4_l3pages);
+			g_xnu.m4_l3pages = 0;
+			g_xnu.m4_n_l3 = 0;
+		}
+		if (g_xnu.m4_chunks) {
+			fki_chunk_free_16k(g_xnu.m4_n_chunks, g_xnu.m4_chunks);
+			fki_vfree(g_xnu.m4_chunks);
+			g_xnu.m4_chunks = 0;
+			g_xnu.m4_n_chunks = 0;
+		}
+		if (g_xnu.l2page.va) {
+			fki_contig_free(&g_xnu.l2page);
+			g_xnu.l2page.va = 0;
+		}
+	} else if (g_xnu.mode == 3) {
+		if (g_xnu.img.region.va) {
+			fki_contig_free(&g_xnu.img.region);
+			g_xnu.img.region.va = 0;
+		}
+		if (g_xnu.l2page.va) {
+			fki_contig_free(&g_xnu.l2page);
+			g_xnu.l2page.va = 0;
+		}
+	} else if (g_xnu.img.region.va) {
+		fki_region_free(&g_xnu.img.region);
+		g_xnu.img.region.va = 0;
+	}
+	if (g_xnu.blob) {
+		fki_blob_put(g_xnu.blob);
+		g_xnu.blob = 0;
+	}
+	if (g_xnu.rd_blob) {
+		fki_blob_put(g_xnu.rd_blob);
+		g_xnu.rd_blob = 0;
+	}
+	if (g_xnu.tc_blob) {
+		fki_blob_put(g_xnu.tc_blob);
+		g_xnu.tc_blob = 0;
+	}
+	if (g_xnu.hd_file) {
+		fki_file_close(g_xnu.hd_file);
+		g_xnu.hd_file = 0;
+	}
+	if (g_xnu.ks_file) {
+		fki_file_close(g_xnu.ks_file);
+		g_xnu.ks_file = 0;
+	}
+	if (g_xnu.dk_file) {
+		fki_file_close(g_xnu.dk_file);
+		g_xnu.dk_file = 0;
+	}
+	if (g_xnu.ci_file) {
+		fki_file_close(g_xnu.ci_file);
+		g_xnu.ci_file = 0;
+	}
+	if (g_xnu.in_file) {
+		fki_file_close(g_xnu.in_file);
+		g_xnu.in_file = 0;
+	}
+}
+
 static int __init xnu_init(void)
 {
 	const void *data;
@@ -245,6 +347,7 @@ static int __init xnu_init(void)
 				   &g_xnu.rd_size, &g_xnu.rd_blob);
 		if (err) {
 			xnu_logkv("xnu: cannot read RAM disk", (u64_t)err);
+			xnu_cleanup();
 			return err;
 		}
 	}
@@ -253,6 +356,7 @@ static int __init xnu_init(void)
 				   &g_xnu.tc_size, &g_xnu.tc_blob);
 		if (err) {
 			xnu_logkv("xnu: cannot read trust cache", (u64_t)err);
+			xnu_cleanup();
 			return err;
 		}
 	}
@@ -286,6 +390,7 @@ static int __init xnu_init(void)
 		g_xnu.dk_file = fki_file_open(g_xnu.disk, 1, &g_xnu.dk_size);
 		if (!g_xnu.dk_file) {
 			xnu_logs("xnu: cannot open block disk");
+			xnu_cleanup();
 			return -2;
 		}
 		xnu_logkv("xnu: block disk bytes", g_xnu.dk_size);
@@ -295,6 +400,7 @@ static int __init xnu_init(void)
 					      &g_xnu.hd_size);
 		if (!g_xnu.hd_file) {
 			xnu_logs("xnu: cannot open host disk");
+			xnu_cleanup();
 			return -2;
 		}
 		xnu_logkv("xnu: host disk bytes", g_xnu.hd_size);
@@ -303,20 +409,20 @@ static int __init xnu_init(void)
 	err = fki_blob_get(g_xnu.image, &data, &size, &g_xnu.blob);
 	if (err) {
 		xnu_logkv("xnu: cannot read image", (u64_t)err);
+		xnu_cleanup();
 		return err;
 	}
 	err = macho_load(&g_xnu.img, data, size,
-			 g_xnu.mode == 3 ? ~0UL :
+			 (g_xnu.mode == 3 || g_xnu.mode == 4) ? ~0UL :
 			 g_xnu.mode == 2 ? (unsigned long)g_xnu.ram_mb << 20 : 0);
 	if (err) {
 		xnu_logkv("xnu: load failed", (u64_t)err);
-		fki_blob_put(g_xnu.blob);
-		g_xnu.blob = 0;
+		xnu_cleanup();
 		return err;
 	}
 	xnu_logkv("xnu: image vmlow", g_xnu.img.vmlow);
 	xnu_logkv("xnu: image size", g_xnu.img.vmhigh - g_xnu.img.vmlow);
-	if (g_xnu.mode != 3) {
+	if (g_xnu.mode != 3 && g_xnu.mode != 4) {
 		xnu_logkv("xnu: region at", (u64_t)g_xnu.img.region.va);
 		xnu_logkv("xnu: region size", g_xnu.img.region.size);
 	}
@@ -324,55 +430,18 @@ static int __init xnu_init(void)
 	fki_random(&xnu_W.xnu_keys, sizeof(xnu_W.xnu_keys));
 	xnu_W.xnu_keys.sctlr_en = ~0ULL;
 
-	return g_xnu.mode == 1 ? xnu_run_m1() :
-	       g_xnu.mode == 3 ? xnu_run_m2b() : xnu_run_m2a();
+	err = g_xnu.mode == 1 ? xnu_run_m1() :
+	      (g_xnu.mode == 3 || g_xnu.mode == 4) ? xnu_run_m2b() :
+	      xnu_run_m2a();
+	if (err) {
+		xnu_cleanup();
+	}
+	return err;
 }
 
 static void __exit xnu_exit(void)
 {
-	if (g_xnu.window_l1) {
-		int i;
-
-		for (i = 0; i < 512; i++) {
-			if (g_xnu.window_owned[i]) {
-				fki_window_set(&g_xnu.window_l1[i], 0);
-			}
-		}
-	}
-	if (g_xnu.mode == 3) {
-		if (g_xnu.img.region.va) {
-			fki_contig_free(&g_xnu.img.region);
-		}
-		if (g_xnu.l2page.va) {
-			fki_contig_free(&g_xnu.l2page);
-		}
-	} else if (g_xnu.img.region.va) {
-		fki_region_free(&g_xnu.img.region);
-	}
-	if (g_xnu.blob) {
-		fki_blob_put(g_xnu.blob);
-	}
-	if (g_xnu.rd_blob) {
-		fki_blob_put(g_xnu.rd_blob);
-	}
-	if (g_xnu.tc_blob) {
-		fki_blob_put(g_xnu.tc_blob);
-	}
-	if (g_xnu.hd_file) {
-		fki_file_close(g_xnu.hd_file);
-	}
-	if (g_xnu.ks_file) {
-		fki_file_close(g_xnu.ks_file);
-	}
-	if (g_xnu.dk_file) {
-		fki_file_close(g_xnu.dk_file);
-	}
-	if (g_xnu.ci_file) {
-		fki_file_close(g_xnu.ci_file);
-	}
-	if (g_xnu.in_file) {
-		fki_file_close(g_xnu.in_file);
-	}
+	xnu_cleanup();
 }
 
 module_init(xnu_init);

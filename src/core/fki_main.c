@@ -8,6 +8,7 @@
 #include <linux/printk.h>
 
 #include "fki.h"
+#include "fki_console.h"
 #include "fki_cpu.h"
 #include "fki_hook.h"
 #include "fki_hostcall.h"
@@ -59,6 +60,11 @@ static int __init fki_init(void)
 		pr_warn("[fki] no /dev/xnu-hostcall (%d)\n", err);
 	}
 
+	err = fki_console_init();
+	if (err) {
+		pr_warn("[fki] no /dev/xnu-console (%d)\n", err);
+	}
+
 	fki_io_init();
 	pr_info("[fki] initialized v%d\n", FKI_VERSION);
 	return 0;
@@ -73,6 +79,7 @@ err_sym:
 static void __exit fki_exit(void)
 {
 	fki_io_exit();
+	fki_console_exit();
 	fki_hostcall_exit();
 	fki_mem_exit();
 	fki_cpu_exit();

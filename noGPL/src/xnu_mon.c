@@ -276,10 +276,36 @@ static int fb_fn(void *arg)
 	}
 	while (!fki_thread_should_stop()) {
 		fki_msleep(g_xnu.fb_dump_ms);
-		fki_file_pwrite(file,
-				(unsigned char *)g_xnu.img.region.va +
-				g_xnu.fb_off,
-				XNU_FB_SIZE, 0);
+		if (g_xnu.mode == 4 && g_xnu.m4_chunks) {
+			u64_t rem = XNU_FB_SIZE;
+			u64_t off = g_xnu.fb_off;
+			u64_t foff = 0;
+
+			while (rem) {
+				unsigned int ci = (unsigned int)
+					(off >> LINUX64_CHUNK_SHIFT);
+				u64_t coff = off & (LINUX64_CHUNK_SIZE - 1);
+				u64_t take = LINUX64_CHUNK_SIZE - coff;
+
+				if (take > rem) {
+					take = rem;
+				}
+				if (ci >= g_xnu.m4_n_chunks) {
+					break;
+				}
+				fki_file_pwrite(file,
+						(unsigned char *)g_xnu.m4_chunks[ci].va + coff,
+						(unsigned long)take, foff);
+				off += take;
+				foff += take;
+				rem -= take;
+			}
+		} else {
+			fki_file_pwrite(file,
+					(unsigned char *)g_xnu.img.region.va +
+					g_xnu.fb_off,
+					XNU_FB_SIZE, 0);
+		}
 	}
 	fki_file_close(file);
 	return 0;
@@ -298,7 +324,7 @@ void xnu_mon_start(void)
 					     "xnu-monitor");
 	}
 	if (g_xnu.fb_off && g_xnu.fb_dump && g_xnu.fb_dump_ms > 0 &&
-	    g_xnu.img.region.va) {
+	    (g_xnu.img.region.va || (g_xnu.mode == 4 && g_xnu.m4_chunks))) {
 		g_fb_thread = fki_thread_start(fb_fn, 0,
 					       g_xnu.monitor_cpu >= 0 ?
 					       g_xnu.monitor_cpu : host_cpu,

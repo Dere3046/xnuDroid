@@ -25,6 +25,31 @@ unsigned long long *xnu_tbl_va(u64_t desc)
 {
 	u64_t pa = desc & 0x0000fffffffff000ULL;
 
+	if (g_xnu.mode == 4) {
+		unsigned int tag;
+		unsigned long h;
+		unsigned long mask;
+
+		if (!g_xnu.m4_h2g || !g_xnu.m4_chunks) {
+			return 0;
+		}
+		tag = (unsigned int)(pa >> LINUX64_CHUNK_SHIFT) + 1U;
+		mask = g_xnu.m4_hash_mask;
+		h = (unsigned long)(((u64_t)tag *
+				     11400714819323198485ULL) >> 32) & mask;
+		while (g_xnu.m4_h2g[h].hpa_tag != 0) {
+			if (g_xnu.m4_h2g[h].hpa_tag == tag) {
+				unsigned int idx = g_xnu.m4_h2g[h].chunk_idx;
+
+				return (unsigned long long *)
+					((char *)g_xnu.m4_chunks[idx].va +
+					 (pa & (LINUX64_CHUNK_SIZE - 1)));
+			}
+			h = (h + 1) & mask;
+		}
+		return 0;
+	}
+
 	if (pa < g_xnu.img.region.pa ||
 	    pa >= g_xnu.img.region.pa + g_xnu.img.region.size) {
 		return 0;
@@ -383,6 +408,56 @@ static struct boot_args_v2 *build_boot(unsigned char *base_va, u64_t phys,
 		*tail++ = ' ';
 		x_memcpy(tail, g_xnu.bootargs, x_strlen(g_xnu.bootargs) + 1);
 	}
+	if (g_xnu.mode == 4) {
+		u64_t off_map = (ba->top_of_kernel_data - phys + 0xfffULL) &
+				~0xfffULL;
+		unsigned int n = g_xnu.m4_n_chunks;
+		unsigned int slots = 64U;
+		u64_t g2h_sz;
+		u64_t map_sz;
+		unsigned int *g2h;
+		struct linux64_h2g_slot *h2g;
+		unsigned int k;
+
+		while (slots < n * 2U) {
+			slots <<= 1;
+		}
+		g2h_sz = ((u64_t)n * sizeof(unsigned int) + 63ULL) & ~63ULL;
+		map_sz = g2h_sz + (u64_t)slots * sizeof(*h2g);
+		if (map_sz > g_xnu.m4_map_reserve) {
+			xnu_logs("xnu: mode 4 phys map too large");
+			return 0;
+		}
+		g2h = (unsigned int *)(base_va + off_map);
+		h2g = (struct linux64_h2g_slot *)(base_va + off_map + g2h_sz);
+		for (k = 0; k < slots; k++) {
+			h2g[k].hpa_tag = 0;
+			h2g[k].chunk_idx = 0;
+		}
+		for (k = 0; k < n; k++) {
+			unsigned int tag = (unsigned int)
+				(g_xnu.m4_chunks[k].pa >> LINUX64_CHUNK_SHIFT) +
+				1U;
+			unsigned long h = (unsigned long)
+				(((u64_t)tag * 11400714819323198485ULL) >> 32) &
+				(slots - 1U);
+
+			g2h[k] = tag - 1U;
+			while (h2g[h].hpa_tag != 0) {
+				h = (h + 1U) & (slots - 1U);
+			}
+			h2g[h].hpa_tag = tag;
+			h2g[h].chunk_idx = k;
+		}
+		g_xnu.m4_gpa_base = phys;
+		g_xnu.m4_hash_mask = slots - 1U;
+		g_xnu.m4_g2h = g2h;
+		g_xnu.m4_h2g = h2g;
+		ba->top_of_kernel_data = phys + ((off_map + map_sz + 0x3fffULL) &
+						 ~0x3fffULL);
+		xnu_logkv("xnu: mode 4 phys map bytes", map_sz);
+	}
+
 	xnu_logkv("xnu: boot args at", (u64_t)ba);
 	xnu_logkv("xnu: ADT bytes", dt_len);
 	xnu_logkv("xnu: topOfKernelData (phys)", ba->top_of_kernel_data);
@@ -522,6 +597,8 @@ int xnu_run_m2b(void)
 	u64_t nat_base = g_xnu.img.vmlow & ~0x1fffffULL;
 	u64_t image_off = g_xnu.img.vmlow - nat_base;
 	u64_t want;
+	u64_t total_size;
+	u64_t phys_base;
 	u64_t boot_map;
 	u64_t win_base;
 	u64_t off;
@@ -543,6 +620,21 @@ int xnu_run_m2b(void)
 	}
 	want = image_off + image_size + 0x60000 + XNU_BOOT_EXTRA +
 	       ((u64_t)g_xnu.ram_mb << 20);
+	if (g_xnu.mode == 4) {
+		unsigned long est_chunks = (unsigned long)
+			((want >> LINUX64_CHUNK_SHIFT) + 1024UL);
+		unsigned int slots = 64U;
+
+		while (slots < est_chunks * 2UL) {
+			slots <<= 1;
+		}
+		g_xnu.m4_map_reserve =
+			(((u64_t)est_chunks * sizeof(unsigned int) +
+			  (u64_t)slots * sizeof(struct linux64_h2g_slot) +
+			  0x3fffULL) & ~0x3fffULL) + 0x100000ULL;
+		want = (want + g_xnu.m4_map_reserve + 0x1fffffULL) &
+		       ~0x1fffffULL;
+	}
 	err = fki_window_l1(XNU_VA_LO, &l1, &l1pa);
 	if (err) {
 		xnu_logs("xnu: no L1 table for top window");
@@ -563,16 +655,46 @@ int xnu_run_m2b(void)
 	g_xnu.va_lo = XNU_VA_BASE + ((u64_t)l1_first << 30);
 	g_xnu.va_hi = XNU_VA_BASE + ((u64_t)(l1_last + 1) << 30);
 
-	err = fki_contig_alloc(want, &g_xnu.img.region);
-	if (err) {
-		xnu_logkv("xnu: contiguous allocation failed", (u64_t)err);
-		return err;
-	}
-	xnu_logkv("xnu: contiguous DRAM phys", g_xnu.img.region.pa);
-	xnu_logkv("xnu: contiguous DRAM size", g_xnu.img.region.size);
-	if (g_xnu.img.region.pa & 0x1fffff) {
-		xnu_logs("xnu: region not 2 MiB aligned");
-		return -22;
+	if (g_xnu.mode == 4) {
+		unsigned long n_chunks = (unsigned long)
+			(want >> LINUX64_CHUNK_SHIFT);
+
+		g_xnu.m4_chunks = fki_valloc(n_chunks *
+					     sizeof(*g_xnu.m4_chunks));
+		if (!g_xnu.m4_chunks) {
+			return -12;
+		}
+		err = fki_chunk_alloc_16k(n_chunks, g_xnu.m4_chunks);
+		if (err) {
+			xnu_logkv("xnu: 16K chunk allocation failed",
+				  (u64_t)err);
+			fki_vfree(g_xnu.m4_chunks);
+			g_xnu.m4_chunks = 0;
+			return err;
+		}
+		g_xnu.m4_n_chunks = (unsigned int)n_chunks;
+		total_size = (u64_t)n_chunks << LINUX64_CHUNK_SHIFT;
+		phys_base = XNU_FAKE_PHYS;
+		xnu_logkv("xnu: mode 4 chunks (16K)", (u64_t)n_chunks);
+		xnu_logkv("xnu: mode 4 chunk[0] HPA", g_xnu.m4_chunks[0].pa);
+		xnu_logkv("xnu: mode 4 chunk[last] HPA",
+			  g_xnu.m4_chunks[n_chunks - 1].pa);
+		xnu_logkv("xnu: mode 4 guest DRAM size", total_size);
+	} else {
+		err = fki_contig_alloc(want, &g_xnu.img.region);
+		if (err) {
+			xnu_logkv("xnu: contiguous allocation failed",
+				  (u64_t)err);
+			return err;
+		}
+		xnu_logkv("xnu: contiguous DRAM phys", g_xnu.img.region.pa);
+		xnu_logkv("xnu: contiguous DRAM size", g_xnu.img.region.size);
+		if (g_xnu.img.region.pa & 0x1fffff) {
+			xnu_logs("xnu: region not 2 MiB aligned");
+			return -22;
+		}
+		total_size = g_xnu.img.region.size;
+		phys_base = g_xnu.img.region.pa;
 	}
 
 	err = fki_contig_alloc(4096, &g_xnu.l2page);
@@ -581,12 +703,21 @@ int xnu_run_m2b(void)
 	}
 	l2 = g_xnu.l2page.va;
 	first = (unsigned)((win_base >> 21) & 511U);
-	boot_map = g_xnu.img.region.size;
+	boot_map = total_size;
+	if (g_xnu.mode == 4) {
+		u64_t boot_need = (image_off + image_size + 0x60000 +
+				   XNU_BOOT_EXTRA + g_xnu.m4_map_reserve +
+				   (32ULL << 20) + 0x1fffffULL) & ~0x1fffffULL;
+
+		if (boot_map > boot_need) {
+			boot_map = boot_need;
+		}
+	}
 	if (boot_map > ((u64_t)(512 - first) << 21)) {
 		boot_map = (u64_t)(512 - first) << 21;
 	}
 	if (boot_map < image_off + image_size + 0x60000 + XNU_BOOT_EXTRA +
-	    (64ULL << 20)) {
+	    (g_xnu.mode == 4 ? g_xnu.m4_map_reserve : 0ULL) + (16ULL << 20)) {
 		xnu_logs("xnu: image does not fit in bootstrap window");
 		return -22;
 	}
@@ -594,10 +725,46 @@ int xnu_run_m2b(void)
 	xnu_logkv("xnu: bootstrap window bytes", boot_map);
 	xnu_logkv("xnu: L1 slot", idx);
 
-	for (off = 0; off < boot_map; off += 0x200000) {
-		l2[first + (off >> 21)] = (g_xnu.img.region.pa + off) |
-					  (1ULL << 54) | (1ULL << 51) |
-					  (1ULL << 10) | (3ULL << 8) | 1;
+	if (g_xnu.mode == 4) {
+		unsigned int n_l3 = (unsigned int)(boot_map >> 21);
+		unsigned int ti;
+
+		g_xnu.m4_l3pages = fki_valloc(n_l3 *
+					      sizeof(*g_xnu.m4_l3pages));
+		if (!g_xnu.m4_l3pages) {
+			return -12;
+		}
+		g_xnu.m4_n_l3 = n_l3;
+		for (ti = 0; ti < n_l3; ti++) {
+			unsigned long long *l3;
+			unsigned int j;
+
+			err = fki_contig_alloc(4096, &g_xnu.m4_l3pages[ti]);
+			if (err) {
+				xnu_logkv("xnu: mode 4 L3 table alloc failed",
+					  (u64_t)err);
+				return err;
+			}
+			l3 = g_xnu.m4_l3pages[ti].va;
+			for (j = 0; j < 512U; j++) {
+				u64_t p_off = ((u64_t)ti << 21) +
+					      ((u64_t)j << 12);
+				unsigned int ci = (unsigned int)
+					(p_off >> LINUX64_CHUNK_SHIFT);
+				u64_t hpa = g_xnu.m4_chunks[ci].pa +
+					    (p_off & 0x3000ULL);
+
+				l3[j] = hpa | (1ULL << 54) | (1ULL << 51) |
+					(1ULL << 10) | (3ULL << 8) | 3;
+			}
+			l2[first + ti] = g_xnu.m4_l3pages[ti].pa | 3;
+		}
+	} else {
+		for (off = 0; off < boot_map; off += 0x200000) {
+			l2[first + (off >> 21)] = (phys_base + off) |
+						  (1ULL << 54) | (1ULL << 51) |
+						  (1ULL << 10) | (3ULL << 8) | 1;
+		}
 	}
 
 	g_xnu.window_slot = &l1[idx];
@@ -609,8 +776,7 @@ int xnu_run_m2b(void)
 	base = (unsigned char *)win_base;
 	macho_copy(&g_xnu.img, base + image_off);
 	g_xnu.img.slide = (u64_t)(base + image_off) - g_xnu.img.vmlow;
-	ba = build_boot(base, g_xnu.img.region.pa, g_xnu.img.region.size,
-			image_off, image_size);
+	ba = build_boot(base, phys_base, total_size, image_off, image_size);
 	if (!ba) {
 		return -22;
 	}

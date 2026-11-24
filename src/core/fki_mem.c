@@ -14,10 +14,13 @@
 #include <linux/mm.h>
 #include <linux/module.h>
 #include <linux/nodemask.h>
+#include <linux/pageblock-flags.h>
 #include <linux/preempt.h>
 #include <linux/printk.h>
+#include <linux/sched.h>
 #include <linux/sizes.h>
 #include <linux/string.h>
+#include <linux/version.h>
 #include <linux/vmalloc.h>
 #include <asm/barrier.h>
 #include <asm/pgtable.h>
@@ -37,7 +40,18 @@ typedef void (*vfree_fn)(const void *addr);
 typedef struct page *(*vmalloc_to_page_fn)(const void *vmalloc_addr);
 typedef struct page *(*alloc_contig_fn)(unsigned long nr_pages, gfp_t gfp,
 					int nid, nodemask_t *nodemask);
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 1, 0)
+typedef int (*alloc_contig_range_fn)(unsigned long start, unsigned long end,
+				     unsigned int migratetype, gfp_t gfp,
+				     struct acr_info *info);
+#else
+typedef int (*alloc_contig_range_fn)(unsigned long start, unsigned long end,
+				     unsigned int migratetype, gfp_t gfp);
+#endif
 typedef void (*free_contig_fn)(unsigned long pfn, unsigned long nr_pages);
+typedef unsigned long (*pfnblock_flags_fn)(const struct page *page,
+					   unsigned long pfn,
+					   unsigned long mask);
 typedef struct page *(*cma_alloc_fn)(struct cma *cma, unsigned long count,
 				     unsigned int align, bool no_warn);
 typedef bool (*cma_release_fn)(struct cma *cma, const struct page *pages,
@@ -93,6 +107,39 @@ static __nocfi noinline struct page *call_alloc_contig(unsigned long nr_pages,
 	return fn(nr_pages, gfp, nid, NULL);
 }
 
+static __nocfi noinline int call_alloc_contig_range(unsigned long start,
+						    unsigned long end,
+						    gfp_t gfp)
+{
+	alloc_contig_range_fn fn =
+		(alloc_contig_range_fn)fki_sym_addr(FKI_SYM_ALLOC_CONTIG_RANGE);
+
+	if (!fn) {
+		return -ENOENT;
+	}
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 1, 0)
+	{
+		struct acr_info info = {};
+
+		return fn(start, end, MIGRATE_MOVABLE, gfp, &info);
+	}
+#else
+	return fn(start, end, MIGRATE_MOVABLE, gfp);
+#endif
+}
+
+static __nocfi noinline int call_pageblock_migratetype(const struct page *pg,
+						       unsigned long pfn)
+{
+	pfnblock_flags_fn fn =
+		(pfnblock_flags_fn)fki_sym_addr(FKI_SYM_PFNBLOCK_FLAGS);
+
+	if (!fn) {
+		return MIGRATE_MOVABLE;
+	}
+	return (int)fn(pg, pfn, MIGRATETYPE_MASK);
+}
+
 static __nocfi noinline void call_free_contig(unsigned long pfn,
 					      unsigned long nr_pages)
 {
@@ -114,7 +161,8 @@ static struct cma *get_default_cma(void)
 	return *area;
 }
 
-static __nocfi noinline struct page *call_cma_alloc(unsigned long cnt)
+static __nocfi noinline struct page *call_cma_alloc_align(unsigned long cnt,
+							  unsigned int align)
 {
 	struct cma *cma = get_default_cma();
 	cma_alloc_fn fn = (cma_alloc_fn)fki_sym_addr(FKI_SYM_CMA_ALLOC);
@@ -122,7 +170,12 @@ static __nocfi noinline struct page *call_cma_alloc(unsigned long cnt)
 	if (!cma || !fn) {
 		return NULL;
 	}
-	return fn(cma, cnt, get_order(SZ_2M), true);
+	return fn(cma, cnt, align, true);
+}
+
+static struct page *call_cma_alloc(unsigned long cnt)
+{
+	return call_cma_alloc_align(cnt, get_order(SZ_2M));
 }
 
 static __nocfi noinline void call_cma_release(const struct page *pg,
@@ -311,6 +364,93 @@ static int fki_carve_check(unsigned long base, unsigned long len)
 	return 0;
 }
 
+static bool fki_range_valid_movable(struct zone *z, unsigned long start,
+				    unsigned long nr_pages,
+				    unsigned long *bad_pfn)
+{
+	unsigned long pfn;
+	unsigned long end = start + nr_pages;
+
+	for (pfn = start; pfn < end; pfn++) {
+		struct page *pg;
+
+		if (!pfn_valid(pfn)) {
+			*bad_pfn = pfn;
+			return false;
+		}
+		pg = pfn_to_page(pfn);
+		if (page_zone(pg) != z || PageReserved(pg)) {
+			*bad_pfn = pfn;
+			return false;
+		}
+		if ((pfn == start || IS_ALIGNED(pfn, pageblock_nr_pages)) &&
+		    call_pageblock_migratetype(pg, pfn) != MIGRATE_MOVABLE) {
+			*bad_pfn = pfn;
+			return false;
+		}
+	}
+	return true;
+}
+
+static struct page *fki_contig_range_alloc(unsigned long nr_pages)
+{
+	unsigned long step = max_t(unsigned long, SZ_2M >> PAGE_SHIFT,
+				   pageblock_nr_pages);
+	unsigned long fail_step = max_t(unsigned long, step, nr_pages >> 2);
+	pg_data_t *pgdat = NODE_DATA(numa_node_id());
+	int tries = 0;
+	int zi;
+
+	if (!fki_sym_addr(FKI_SYM_ALLOC_CONTIG_RANGE) ||
+	    !fki_sym_addr(FKI_SYM_FREE_CONTIG)) {
+		return NULL;
+	}
+	fail_step = ALIGN(fail_step, step);
+
+	for (zi = MAX_NR_ZONES - 1; zi >= 0 && tries < 64; zi--) {
+		struct zone *z = &pgdat->node_zones[zi];
+		unsigned long z_start;
+		unsigned long z_end;
+		unsigned long cur;
+
+		if (!populated_zone(z)) {
+			continue;
+		}
+		z_start = ALIGN(z->zone_start_pfn, step);
+		z_end = ALIGN_DOWN(zone_end_pfn(z), step);
+		if (z_end <= z_start || (z_end - z_start) < nr_pages) {
+			continue;
+		}
+		cur = z_end;
+		while (cur >= z_start + nr_pages && tries < 64) {
+			unsigned long cand = cur - nr_pages;
+			unsigned long bad_pfn = 0;
+
+			if (!fki_range_valid_movable(z, cand, nr_pages,
+						     &bad_pfn)) {
+				unsigned long next = ALIGN_DOWN(bad_pfn, step);
+
+				cur = (next < cur) ? next : (cur - step);
+				continue;
+			}
+			cond_resched();
+			tries++;
+			if (!call_alloc_contig_range(cand, cand + nr_pages,
+						     GFP_KERNEL | __GFP_NOWARN)) {
+				pr_info("[fki] contig range %lu MiB at %#llx\n",
+					(nr_pages << PAGE_SHIFT) >> 20,
+					(u64)PFN_PHYS(cand));
+				return pfn_to_page(cand);
+			}
+			if (cur < z_start + fail_step) {
+				break;
+			}
+			cur -= fail_step;
+		}
+	}
+	return NULL;
+}
+
 int fki_contig_alloc(unsigned long size, struct fki_region *region)
 {
 	unsigned long nr_pages = 1;
@@ -319,6 +459,18 @@ int fki_contig_alloc(unsigned long size, struct fki_region *region)
 
 	if (!region || !size) {
 		return -EINVAL;
+	}
+
+	if (size <= PAGE_SIZE) {
+		pg = alloc_pages(GFP_KERNEL | __GFP_NOWARN | __GFP_ZERO, 0);
+		if (!pg) {
+			return -ENOMEM;
+		}
+		region->va = page_address(pg);
+		region->size = PAGE_SIZE;
+		region->pa = page_to_phys(pg);
+		region->handle = (void *)((unsigned long)pg | 4UL);
+		return 0;
 	}
 
 	if (carve_mb && !g_carve_used &&
@@ -369,6 +521,20 @@ int fki_contig_alloc(unsigned long size, struct fki_region *region)
 		}
 	}
 
+	if (size >= SZ_2M) {
+		unsigned long cnt = ALIGN(size, SZ_2M) >> PAGE_SHIFT;
+
+		pg = fki_contig_range_alloc(cnt);
+		if (pg) {
+			region->va = page_address(pg);
+			region->size = cnt << PAGE_SHIFT;
+			memset(region->va, 0, region->size);
+			region->pa = page_to_phys(pg);
+			region->handle = pg;
+			return 0;
+		}
+	}
+
 	if (!fki_sym_addr(FKI_SYM_ALLOC_CONTIG)) {
 		return -ENOENT;
 	}
@@ -399,6 +565,13 @@ void fki_contig_free(struct fki_region *region)
 		g_carve_used = false;
 		return;
 	}
+	if ((unsigned long)region->handle & 4UL) {
+		struct page *pg =
+			(struct page *)((unsigned long)region->handle & ~4UL);
+
+		__free_pages(pg, 0);
+		return;
+	}
 	if ((unsigned long)region->handle & 2UL) {
 		g_resv_used = false;
 		return;
@@ -413,6 +586,223 @@ void fki_contig_free(struct fki_region *region)
 			 region->size >> PAGE_SHIFT);
 }
 EXPORT_SYMBOL(fki_contig_free);
+
+void *fki_valloc(unsigned long size)
+{
+	if (!size) {
+		return NULL;
+	}
+	return call_vzalloc(size);
+}
+EXPORT_SYMBOL(fki_valloc);
+
+void fki_vfree(const void *addr)
+{
+	if (addr) {
+		call_vfree(addr);
+	}
+}
+EXPORT_SYMBOL(fki_vfree);
+
+static bool pfn_range_skip_acr(unsigned long cand, unsigned long nr_pages)
+{
+	unsigned long k;
+
+	for (k = 0; k < nr_pages; k++) {
+		struct page *p = pfn_to_page(cand + k);
+
+		if (PageReserved(p)) {
+			return true;
+		}
+		if (page_count(p) && !PageLRU(p)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+int fki_chunk_alloc_16k(unsigned long count, struct fki_chunk *chunks)
+{
+	unsigned long nr_pages = SZ_16K >> PAGE_SHIFT;
+	unsigned int order = get_order(SZ_16K);
+	pg_data_t *pgdat = NODE_DATA(numa_node_id());
+	unsigned long got = 0;
+	unsigned long t_buddy = 0;
+	unsigned long t_reclaim = 0;
+	unsigned long t_cma = 0;
+	unsigned long t_acr = 0;
+	unsigned long t_kern = 0;
+	int zi;
+
+	if (!chunks || !count) {
+		return -EINVAL;
+	}
+	memset(chunks, 0, sizeof(*chunks) * count);
+
+	while (got < count) {
+		struct page *pg;
+
+		pg = alloc_pages(GFP_HIGHUSER_MOVABLE | __GFP_ZERO |
+				 __GFP_NOWARN, order);
+		if (!pg) {
+			break;
+		}
+		chunks[got].pa = page_to_phys(pg);
+		chunks[got].va = page_address(pg);
+		chunks[got].handle = pg;
+		chunks[got].kind = 0;
+		got++;
+		t_buddy++;
+		if ((got & 255UL) == 0) {
+			cond_resched();
+		}
+	}
+
+	while (got < count) {
+		struct page *pg = call_cma_alloc_align(nr_pages, order);
+
+		if (!pg) {
+			break;
+		}
+		chunks[got].pa = page_to_phys(pg);
+		chunks[got].va = page_address(pg);
+		memset(chunks[got].va, 0, SZ_16K);
+		chunks[got].handle = pg;
+		chunks[got].kind = 1;
+		got++;
+		t_cma++;
+		if ((got & 63UL) == 0) {
+			cond_resched();
+		}
+	}
+
+	while (got < count) {
+		struct page *pg;
+
+		pg = alloc_pages(GFP_HIGHUSER_MOVABLE | __GFP_ZERO |
+				 __GFP_RETRY_MAYFAIL | __GFP_NOWARN, order);
+		if (!pg) {
+			break;
+		}
+		chunks[got].pa = page_to_phys(pg);
+		chunks[got].va = page_address(pg);
+		chunks[got].handle = pg;
+		chunks[got].kind = 0;
+		got++;
+		t_reclaim++;
+		if ((got & 127UL) == 0) {
+			cond_resched();
+		}
+	}
+
+	if (got < count && fki_sym_addr(FKI_SYM_ALLOC_CONTIG_RANGE) &&
+	    fki_sym_addr(FKI_SYM_FREE_CONTIG)) {
+		for (zi = MAX_NR_ZONES - 1; zi >= 0 && got < count; zi--) {
+			struct zone *z = &pgdat->node_zones[zi];
+			unsigned long z_start;
+			unsigned long z_end;
+			unsigned long cand;
+
+			if (!populated_zone(z)) {
+				continue;
+			}
+			z_start = ALIGN(z->zone_start_pfn, nr_pages);
+			z_end = ALIGN_DOWN(zone_end_pfn(z), nr_pages);
+			for (cand = z_start;
+			     cand + nr_pages <= z_end && got < count;
+			     cand += nr_pages) {
+				unsigned long bad_pfn = 0;
+				struct page *pg;
+
+				if (!fki_range_valid_movable(z, cand, nr_pages,
+							     &bad_pfn)) {
+					unsigned long skip = ALIGN(bad_pfn + 1,
+								   pageblock_nr_pages);
+
+					if (skip > cand) {
+						cand = skip - nr_pages;
+					}
+					continue;
+				}
+				if (pfn_range_skip_acr(cand, nr_pages)) {
+					continue;
+				}
+				if ((cand & 63UL) == 0) {
+					cond_resched();
+				}
+				if (!call_alloc_contig_range(cand,
+							     cand + nr_pages,
+							     GFP_KERNEL | __GFP_NOWARN)) {
+					pg = pfn_to_page(cand);
+					chunks[got].pa = PFN_PHYS(cand);
+					chunks[got].va = page_address(pg);
+					memset(chunks[got].va, 0, SZ_16K);
+					chunks[got].handle = pg;
+					chunks[got].kind = 2;
+					got++;
+					t_acr++;
+				}
+			}
+		}
+	}
+
+	while (got < count) {
+		struct page *pg;
+
+		pg = alloc_pages(GFP_KERNEL | __GFP_ZERO | __GFP_NOWARN, order);
+		if (!pg) {
+			break;
+		}
+		chunks[got].pa = page_to_phys(pg);
+		chunks[got].va = page_address(pg);
+		chunks[got].handle = pg;
+		chunks[got].kind = 0;
+		got++;
+		t_kern++;
+		if ((got & 255UL) == 0) {
+			cond_resched();
+		}
+	}
+
+	pr_info("[fki] 16K chunks %lu/%lu (buddy=%lu cma=%lu reclaim=%lu acr=%lu kern=%lu)\n",
+		got, count, t_buddy, t_cma, t_reclaim, t_acr, t_kern);
+	if (got < count) {
+		fki_chunk_free_16k(got, chunks);
+		return -ENOMEM;
+	}
+	return 0;
+}
+EXPORT_SYMBOL(fki_chunk_alloc_16k);
+
+void fki_chunk_free_16k(unsigned long count, struct fki_chunk *chunks)
+{
+	unsigned int order = get_order(SZ_16K);
+	unsigned long nr_pages = SZ_16K >> PAGE_SHIFT;
+	unsigned long i;
+
+	if (!chunks) {
+		return;
+	}
+	for (i = 0; i < count; i++) {
+		struct page *pg = (struct page *)chunks[i].handle;
+
+		if (!pg) {
+			continue;
+		}
+		if (chunks[i].kind == 0) {
+			__free_pages(pg, order);
+		} else if (chunks[i].kind == 1) {
+			call_cma_release(pg, nr_pages);
+		} else if (chunks[i].kind == 2) {
+			call_free_contig(page_to_pfn(pg), nr_pages);
+		}
+		chunks[i].handle = NULL;
+		if ((i & 4095UL) == 4095UL) {
+			cond_resched();
+		}
+	}
+}
+EXPORT_SYMBOL(fki_chunk_free_16k);
 
 static __nocfi noinline void call_set_swapper_pgd(pgd_t *pgdp, u64 desc)
 {

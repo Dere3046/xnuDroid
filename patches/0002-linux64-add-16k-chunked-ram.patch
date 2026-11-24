@@ -1,0 +1,573 @@
+From bc8033cd2f84861f85378a5a502e20337c031369 Mon Sep 17 00:00:00 2001
+From: dere3046 <fine4trn@163.com>
+Date: Tue, 24 Nov 2026 23:33:18 +0800
+Subject: [PATCH 2/3] linux64: add 16k chunked ram
+
+---
+ EXTERNAL_HEADERS/linux64/linux64.h     | 20 ++++++++++
+ EXTERNAL_HEADERS/linux64/linux64_abi.h | 17 ++++++++
+ osfmk/arm/arm_init.c                   | 25 ++++++++++++
+ osfmk/arm/pmap/pmap.c                  | 36 +++++++----------
+ osfmk/arm/pmap/pmap.h                  |  9 +++--
+ osfmk/arm/pmap/pmap_data.h             |  2 +-
+ osfmk/arm/pmap/pmap_pt_geometry.h      |  2 +-
+ osfmk/arm64/arm_vm_init.c              | 54 +++++++++++++-------------
+ osfmk/arm64/machine_routines.c         |  6 ++-
+ osfmk/arm64/machine_routines_asm.s     |  6 +--
+ 10 files changed, 119 insertions(+), 58 deletions(-)
+
+diff --git a/EXTERNAL_HEADERS/linux64/linux64.h b/EXTERNAL_HEADERS/linux64/linux64.h
+index 549fb09..977a6c8 100644
+--- a/EXTERNAL_HEADERS/linux64/linux64.h
++++ b/EXTERNAL_HEADERS/linux64/linux64.h
+@@ -36,7 +36,27 @@ extern "C" {
+ extern unsigned long linux64_hook;
+ extern unsigned long linux64_slide;
+ extern unsigned int linux64_s1pie;
++extern struct linux64_phys_map linux64_phys_map;
+ 
++unsigned long long linux64_hpa_to_gpa(unsigned long long hpa);
++
++static inline unsigned long long
++linux64_gpa_to_hpa(unsigned long long gpa)
++{
++	unsigned long long off;
++	unsigned long idx;
++
++	if (__builtin_expect(!linux64_phys_map.n_chunks, 1)) {
++		return gpa;
++	}
++	if (gpa < linux64_phys_map.gpa_base || gpa >= linux64_phys_map.gpa_end) {
++		return gpa;
++	}
++	off = gpa - linux64_phys_map.gpa_base;
++	idx = (unsigned long)(off >> LINUX64_CHUNK_SHIFT);
++	return ((unsigned long long)linux64_phys_map.g2h[idx] << LINUX64_CHUNK_SHIFT) |
++	       (gpa & (LINUX64_CHUNK_SIZE - 1));
++}
+ /* This CPU's slot in the per-CPU arrays (LINUX64_CPU_SLOT of its MPIDR): valid before XNU knows its cpu number */
+ static inline unsigned
+ linux64_cpu_slot(void)
+diff --git a/EXTERNAL_HEADERS/linux64/linux64_abi.h b/EXTERNAL_HEADERS/linux64/linux64_abi.h
+index 66855e2..44dab90 100644
+--- a/EXTERNAL_HEADERS/linux64/linux64_abi.h
++++ b/EXTERNAL_HEADERS/linux64/linux64_abi.h
+@@ -25,6 +25,23 @@
+ 
+ #define LINUX64_ABI_VERSION 3
+ 
++#define LINUX64_CHUNK_SHIFT 14
++#define LINUX64_CHUNK_SIZE  (1ULL << LINUX64_CHUNK_SHIFT)
++#define LINUX64_CHUNK_MASK  (~(LINUX64_CHUNK_SIZE - 1))
++
++struct linux64_h2g_slot {
++	__UINT32_TYPE__ hpa_tag;	/* shifted hpa plus one */
++	__UINT32_TYPE__ chunk_idx;
++};
++
++struct linux64_phys_map {
++	__UINT64_TYPE__ gpa_base;
++	__UINT64_TYPE__ gpa_end;
++	const __UINT32_TYPE__ *g2h;	/* shifted hpa per 16k chunk */
++	const struct linux64_h2g_slot *h2g;
++	__UINT32_TYPE__ n_chunks;
++	__UINT32_TYPE__ hash_mask;
++};
+ 
+ enum linux64_call {
+ 	LINUX64_CALL_KERNEL_TABLES  = 210,	/* boot: a1 = XNU's kernel L1 table; the host installs its kernel-range entries */
+diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
+index 3887905..31bb2aa 100644
+--- a/osfmk/arm/arm_init.c
++++ b/osfmk/arm/arm_init.c
+@@ -233,10 +233,35 @@ extern vm_offset_t segLOWESTRXAuxKC, segHIGHESTRXAuxKC, segHIGHESTNLEAuxKC;
+ uintptr_t linux64_hook;
+ uintptr_t linux64_slide;
+ unsigned int linux64_s1pie;
++struct linux64_phys_map linux64_phys_map;
+ unsigned int linux64_vint[LINUX64_CPU_SLOTS];
+ unsigned int linux64_ipi_pending[LINUX64_CPU_SLOTS];
+ unsigned long linux64_dbg[LINUX64_NCOUNTERS];
+ 
++unsigned long long
++linux64_hpa_to_gpa(unsigned long long hpa)
++{
++	__UINT32_TYPE__ tag;
++	unsigned long h, mask;
++	const struct linux64_h2g_slot *tab;
++
++	if (!linux64_phys_map.n_chunks || !(tab = linux64_phys_map.h2g)) {
++		return hpa;
++	}
++	tag = (__UINT32_TYPE__)(hpa >> LINUX64_CHUNK_SHIFT) + 1U;
++	mask = linux64_phys_map.hash_mask;
++	h = (unsigned long)(((unsigned long long)tag * 11400714819323198485ULL) >> 32) & mask;
++	while (tab[h].hpa_tag != 0) {
++		if (tab[h].hpa_tag == tag) {
++			return (linux64_phys_map.gpa_base +
++			        ((unsigned long long)tab[h].chunk_idx << LINUX64_CHUNK_SHIFT)) |
++			       (hpa & (LINUX64_CHUNK_SIZE - 1));
++		}
++		h = (h + 1) & mask;
++	}
++	return hpa;
++}
++
+ static void
+ arm_slide_rebase_and_sign_image(void)
+ {
+diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
+index d085730..462f878 100644
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -705,7 +705,7 @@ pte_is_xs(const pt_attr_t *pt_attr, pt_entry_t pte)
+ static inline pt_entry_t
+ linux64_s1pie_pte(pt_entry_t pte)
+ {
+-	/* Linux S1PIE needs bit 51 set on writable leaves and clear on read only */
++	/* Linux S1PIE needs bit 51 (PTE_WRITE) set on writable leaves and clear on RO leaves */
+ 	if (__improbable(linux64_s1pie) && (pte & ARM_PTE_TYPE_VALID) &&
+ 	    (pte & ARM_PTE_AF)) {
+ 		if (!(pte & ARM_PTE_AP(2))) {
+@@ -2021,8 +2021,7 @@ pmap_map_bd_with_options(
+ 	}
+ 
+ 	/* not cacheable and not buffered */
+-	pt_entry_t tmplate = pa_to_pte(start)
+-	    | ARM_PTE_TYPE_VALID | ARM_PTE_AF | ARM_PTE_NX | ARM_PTE_PNX
++	pt_entry_t tmplate = ARM_PTE_TYPE_VALID | ARM_PTE_AF | ARM_PTE_NX | ARM_PTE_PNX
+ 	    | ARM_PTE_AP((prot & VM_PROT_WRITE) ? AP_RWNA : AP_RONA)
+ 	    | mem_attr;
+ 
+@@ -2038,27 +2037,20 @@ pmap_map_bd_with_options(
+ 			panic("pmap_map_bd");
+ 		}
+ 
+-		/**
+-		 * For every iteration, the paddr encoded in tmplate is incrementing,
+-		 * but we always start with the original AP bits defined at the top
+-		 * of the function in tmplate and only modify the AP bits in the pte
+-		 * variable.
+-		 */
+ 		pt_entry_t pte;
+ #if XNU_MONITOR
+ 		if (!pa_valid(paddr)) {
+ 			pte = pmap_construct_io_pte(paddr, tmplate);
+ 		} else {
+-			pte = tmplate;
++			pte = pa_to_pte(paddr) | tmplate;
+ 		}
+ #else /* !XNU_MONITOR */
+-		pte = tmplate;
++		pte = pa_to_pte(paddr) | tmplate;
+ #endif
+ 
+ 		assert(!ARM_PTE_IS_COMPRESSED(*ptep, ptep));
+ 		write_pte_strong(ptep, pte);
+ 
+-		pte_increment_pa(tmplate);
+ 		vaddr += PAGE_SIZE;
+ 		paddr += PAGE_SIZE;
+ 	}
+@@ -3180,7 +3172,7 @@ pmap_create_options_internal(
+ 	for (i = 0; i < tte_index_max; i++) {
+ 		p->hw_tte[i] = ARM_TTE_TYPE_FAULT;
+ 	}
+-	p->hw_tte[0] = (p->ttep & ARM_TTE_TABLE_MASK) | ARM_TTE_TYPE_TABLE | ARM_TTE_VALID;
++	p->hw_tte[0] = pa_to_tte(p->ttep) | ARM_TTE_TYPE_TABLE | ARM_TTE_VALID;
+ 
+ 	FLUSH_PTE();
+ root_ready:
+@@ -3371,7 +3363,7 @@ pmap_deallocate_all_leaf_tts(pmap_t pmap, tt_entry_t * first_ttep, unsigned leve
+ 		/* Must be valid, type table */
+ 		if (level < pt_attr_twig_level(pt_attr)) {
+ 			/* If we haven't reached the twig level, recurse to the next level. */
+-			pmap_deallocate_all_leaf_tts(pmap, (tt_entry_t *)phystokv((tte) & ARM_TTE_TABLE_MASK), level + 1);
++			pmap_deallocate_all_leaf_tts(pmap, (tt_entry_t *)ttetokv(tte), level + 1);
+ 		}
+ 
+ 		/* Remove the TTE. */
+@@ -7114,11 +7106,11 @@ pmap_vtophys(
+ 
+ 		/* This detects both leaf entries and intermediate block mappings. */
+ 		if ((tte & type_mask) == type_block) {
+-			pa = ((tte & ARM_TTE_PA_MASK & ~offmask) | (va & offmask));
++			pa = linux64_hpa_to_gpa((tte & ARM_TTE_PA_MASK & ~offmask) | (va & offmask));
+ 			break;
+ 		}
+ 
+-		ttp = (tt_entry_t*)phystokv(tte & ARM_TTE_TABLE_MASK);
++		ttp = (tt_entry_t*)ttetokv(tte);
+ 	}
+ 
+ 	return pa;
+@@ -7230,7 +7222,7 @@ pmap_expand(
+ 				pmap_init_pte_page(pmap, (pt_entry_t *) tt_p, v, ttlevel + 1, FALSE);
+ 				pa = kvtophys_nofail((vm_offset_t)tt_p);
+ 				tte_p = pmap_ttne(pmap, ttlevel, v);
+-				*tte_p = (pa & ARM_TTE_TABLE_MASK) | ARM_TTE_TYPE_TABLE | ARM_TTE_VALID;
++				*tte_p = pa_to_tte(pa) | ARM_TTE_TYPE_TABLE | ARM_TTE_VALID;
+ 				PMAP_TRACE(4 + ttlevel, PMAP_CODE(PMAP__TTE), VM_KERNEL_ADDRHIDE(pmap), VM_KERNEL_ADDRHIDE(v & ~pt_attr_ln_offmask(pt_attr, ttlevel)),
+ 				    VM_KERNEL_ADDRHIDE((v & ~pt_attr_ln_offmask(pt_attr, ttlevel)) + pt_attr_ln_size(pt_attr, ttlevel)), *tte_p);
+ 				pa = 0x0ULL;
+@@ -8038,7 +8030,7 @@ pmap_switch_user_ttb(pmap_t pmap, pmap_cpu_data_t *cpu_data_ptr)
+ 
+ 
+ 	if (pmap != kernel_pmap) {
+-		set_mmu_ttb((pmap->hw_ttep & TTBR_BADDR_MASK) | (((uint64_t)pmap->hw_asid) << TTBR_ASID_SHIFT));
++		set_mmu_ttb((linux64_gpa_to_hpa(pmap->hw_ttep) & TTBR_BADDR_MASK) | (((uint64_t)pmap->hw_asid) << TTBR_ASID_SHIFT));
+ 	} else if (!pmap_user_ttb_is_clear()) {
+ 		pmap_clear_user_ttb_internal();
+ 	}
+@@ -8047,7 +8039,7 @@ pmap_switch_user_ttb(pmap_t pmap, pmap_cpu_data_t *cpu_data_ptr)
+ MARK_AS_PMAP_TEXT void
+ pmap_clear_user_ttb_internal(void)
+ {
+-	set_mmu_ttb(invalid_ttep & TTBR_BADDR_MASK);
++	set_mmu_ttb(linux64_gpa_to_hpa(invalid_ttep) & TTBR_BADDR_MASK);
+ }
+ 
+ void
+@@ -9345,7 +9337,7 @@ pmap_trim_range(
+ 			continue;
+ 		}
+ 
+-		tt2e_start = &((tt_entry_t*) phystokv(tt1e & ARM_TTE_TABLE_MASK))[0];
++		tt2e_start = &((tt_entry_t*) ttetokv(tt1e))[0];
+ 		tt2e_end = &tt2e_start[pt_attr_page_size(pt_attr) / sizeof(*tt2e_start)];
+ 
+ 		for (tt2e_p = tt2e_start; tt2e_p < tt2e_end; tt2e_p++) {
+@@ -11471,7 +11463,7 @@ pmap_update_tt3e(
+ 	}
+ 
+ 	pte = *ptep;
+-	pte = tte_to_pa(pte) | template;
++	pte = (pte & ARM_TTE_TABLE_MASK) | template;
+ 	write_pte_strong(ptep, pte);
+ }
+ 
+@@ -14836,7 +14828,7 @@ pmap_dump_page_tables_recurse(pmap_t pmap,
+ 				    ttp, cur_level, bufp, buf_end);
+ 			}
+ 
+-			const tt_entry_t *next_tt = (const tt_entry_t*)phystokv(tte & ARM_TTE_TABLE_MASK);
++			const tt_entry_t *next_tt = (const tt_entry_t*)ttetokv(tte);
+ 
+ 			kern_return_t recurse_result = pmap_dump_page_tables_recurse(pmap, next_tt, cur_level + 1,
+ 			    level_mask, current_va, buf_start, buf_end, bytes_copied);
+diff --git a/osfmk/arm/pmap/pmap.h b/osfmk/arm/pmap/pmap.h
+index b236ca6..8c0934c 100644
+--- a/osfmk/arm/pmap/pmap.h
++++ b/osfmk/arm/pmap/pmap.h
+@@ -53,6 +53,7 @@
+ #include <arm/pmap_public.h>
+ #include <kern/ast.h>
+ #include <mach/arm/thread_status.h>
++#include <linux64/linux64.h>
+ 
+ #if defined(__arm64__)
+ #include <arm64/tlb.h>
+@@ -311,11 +312,11 @@ extern pmap_paddr_t mmu_uvtop(vm_offset_t va);
+ #define ttel1num(a)         ((a & ARM_TTE_L1_MASK) >> ARM_TT_L1_SHIFT)
+ #define ttel2num(a)         ((a & ARM_TTE_L2_MASK) >> ARM_TT_L2_SHIFT)
+ 
+-#define pa_to_tte(a)        ((a) & ARM_TTE_TABLE_MASK)
+-#define tte_to_pa(p)        ((p) & ARM_TTE_TABLE_MASK)
++#define pa_to_tte(a)        (linux64_gpa_to_hpa((a) & ARM_TTE_TABLE_MASK))
++#define tte_to_pa(p)        (linux64_hpa_to_gpa((p) & ARM_TTE_TABLE_MASK))
+ 
+-#define pa_to_pte(a)        ((a) & ARM_PTE_PAGE_MASK)
+-#define pte_to_pa(p)        ((p) & ARM_PTE_PAGE_MASK)
++#define pa_to_pte(a)        (linux64_gpa_to_hpa((a) & ARM_PTE_PAGE_MASK))
++#define pte_to_pa(p)        (linux64_hpa_to_gpa((p) & ARM_PTE_PAGE_MASK))
+ #define pte_to_ap(p)        (((p) & ARM_PTE_APMASK) >> ARM_PTE_APSHIFT)
+ #define pte_increment_pa(p) ((p) += ptoa(1))
+ 
+diff --git a/osfmk/arm/pmap/pmap_data.h b/osfmk/arm/pmap/pmap_data.h
+index f66dfba..2cf9d90 100644
+--- a/osfmk/arm/pmap/pmap_data.h
++++ b/osfmk/arm/pmap/pmap_data.h
+@@ -988,7 +988,7 @@ ptep_get_pmap(const pt_entry_t *ptep)
+ static inline pt_desc_t *
+ tte_get_ptd(const tt_entry_t tte)
+ {
+-	const vm_offset_t pt_base_va = (vm_offset_t)(tte & ~((tt_entry_t)PAGE_MASK));
++	const vm_offset_t pt_base_va = (vm_offset_t)(tte_to_pa(tte) & ~((tt_entry_t)PAGE_MASK));
+ 	pv_entry_t **pvh = pai_to_pvh(pa_index(pt_base_va));
+ 
+ 	if (__improbable(!pvh_test_type(pvh, PVH_TYPE_PTDP))) {
+diff --git a/osfmk/arm/pmap/pmap_pt_geometry.h b/osfmk/arm/pmap/pmap_pt_geometry.h
+index aaff3fb..397481c 100644
+--- a/osfmk/arm/pmap/pmap_pt_geometry.h
++++ b/osfmk/arm/pmap/pmap_pt_geometry.h
+@@ -651,7 +651,7 @@ pmap_ttne(pmap_t pmap, unsigned int target_level, vm_map_address_t addr)
+ 			return TT_ENTRY_NULL;
+ 		}
+ 
+-		table_ttep = (tt_entry_t*)phystokv(tte & ARM_TTE_TABLE_MASK);
++		table_ttep = (tt_entry_t*)ttetokv(tte);
+ 	}
+ 
+ 	return ttep;
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index cd928a3..1a39493 100644
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -512,7 +512,7 @@ dump_kva_l2(vm_offset_t tt_base, tt_entry_t *tt, int indent, uint64_t *rosz_out,
+ 
+ 	for (i = 0; i < TTE_PGENTRIES; i++) {
+ 		int tte_type = tt[i] & ARM_TTE_TYPE_MASK;
+-		cur = tt[i] & ARM_TTE_TABLE_MASK;
++		cur = tte_to_pa(tt[i]);
+ 
+ 		if (tt_static) {
+ 			/* addresses mapped by this entry are static if it is a block mapping,
+@@ -577,7 +577,7 @@ dump_kva_space()
+ 			continue;
+ 		}
+ 
+-		cur = cpu_tte[i] & ARM_TTE_TABLE_MASK;
++		cur = tte_to_pa(cpu_tte[i]);
+ 		start = (uint64_t)i << ARM_TT_L1_SHIFT;
+ 		start = start + kva_base;
+ 		end = start + (ARM_TT_L1_SIZE - 1);
+@@ -639,14 +639,13 @@ arm_vm_map(tt_entry_t * root_ttp, vm_offset_t vaddr, pt_entry_t pte)
+ 	if (l1_tte == ARM_TTE_EMPTY) {
+ 		ptpage = alloc_ptpage(TRUE);
+ 		bzero((void *)ptpage, ARM_PGBYTES);
+-		l1_tte = kvtophys(ptpage);
+-		l1_tte &= ARM_TTE_TABLE_MASK;
++		l1_tte = pa_to_tte(kvtophys(ptpage));
+ 		l1_tte |= ARM_TTE_VALID | ARM_TTE_TYPE_TABLE | ARM_TTE_TABLE_AP(ARM_TTE_TABLE_AP_USER_NA);
+ 		*l1_ttep = l1_tte;
+ 		ptpage = 0;
+ 	}
+ 
+-	ttp = (tt_entry_t *)phystokv(l1_tte & ARM_TTE_TABLE_MASK);
++	ttp = (tt_entry_t *)ttetokv(l1_tte);
+ 
+ 	l2_ttep = ttp + ((vaddr & ARM_TT_L2_INDEX_MASK) >> ARM_TT_L2_SHIFT);
+ 	l2_tte = *l2_ttep;
+@@ -654,14 +653,13 @@ arm_vm_map(tt_entry_t * root_ttp, vm_offset_t vaddr, pt_entry_t pte)
+ 	if (l2_tte == ARM_TTE_EMPTY) {
+ 		ptpage = alloc_ptpage(TRUE);
+ 		bzero((void *)ptpage, ARM_PGBYTES);
+-		l2_tte = kvtophys(ptpage);
+-		l2_tte &= ARM_TTE_TABLE_MASK;
++		l2_tte = pa_to_tte(kvtophys(ptpage));
+ 		l2_tte |= ARM_TTE_VALID | ARM_TTE_TYPE_TABLE;
+ 		*l2_ttep = l2_tte;
+ 		ptpage = 0;
+ 	}
+ 
+-	ttp = (tt_entry_t *)phystokv(l2_tte & ARM_TTE_TABLE_MASK);
++	ttp = (tt_entry_t *)ttetokv(l2_tte);
+ 
+ 	ptep = ttp + ((vaddr & ARM_TT_L3_INDEX_MASK) >> ARM_TT_L3_SHIFT);
+ 	cpte = *ptep;
+@@ -744,7 +742,7 @@ arm_vm_kernel_pte(vm_offset_t vaddr)
+ 		return pte;
+ 	}
+ 
+-	ttp = (tt_entry_t *)phystokv(tte & ARM_TTE_TABLE_MASK);
++	ttp = (tt_entry_t *)ttetokv(tte);
+ 	ttep = ttp + ((vaddr & ARM_TT_L2_INDEX_MASK) >> ARM_TT_L2_SHIFT);
+ 	tte = *ttep;
+ 
+@@ -759,7 +757,7 @@ arm_vm_kernel_pte(vm_offset_t vaddr)
+ 		return pte;
+ 	}
+ 
+-	ttp = (tt_entry_t *)phystokv(tte & ARM_TTE_TABLE_MASK);
++	ttp = (tt_entry_t *)ttetokv(tte);
+ 
+ 	ptep = ttp + ((vaddr & ARM_TT_L3_INDEX_MASK) >> ARM_TT_L3_SHIFT);
+ 	pte = *ptep;
+@@ -874,8 +872,8 @@ arm_replace_identity_map(void)
+ 	l1_ptp_virt = (tt_entry_t *)phystokv(l1_ptp_phys);
+ 	tte1 = &l1_ptp_virt[L1_TABLE_T1_INDEX(paddr, TCR_EL1_BOOT)];
+ 
+-	l2_ptp_virt = L2_TABLE_VA(tte1);
+-	l2_ptp_phys = (*tte1) & ARM_TTE_TABLE_MASK;
++	l2_ptp_virt = (tt_entry_t *)ttetokv(*tte1);
++	l2_ptp_phys = tte_to_pa(*tte1);
+ 	tte2 = &l2_ptp_virt[L2_TABLE_INDEX(paddr)];
+ 
+ 	l3_ptp_virt = (pt_entry_t *)alloc_ptpage(TRUE);
+@@ -888,10 +886,10 @@ arm_replace_identity_map(void)
+ 	 */
+ 
+ 	bzero(l1_ptp_virt, ARM_PGBYTES);
+-	*tte1 = ARM_TTE_BOOT_TABLE | (l2_ptp_phys & ARM_TTE_TABLE_MASK);
++	*tte1 = ARM_TTE_BOOT_TABLE | pa_to_tte(l2_ptp_phys);
+ 
+ 	bzero(l2_ptp_virt, ARM_PGBYTES);
+-	*tte2 = ARM_TTE_BOOT_TABLE | (l3_ptp_phys & ARM_TTE_TABLE_MASK);
++	*tte2 = ARM_TTE_BOOT_TABLE | pa_to_tte(l3_ptp_phys);
+ 
+ 	*ptep = (paddr & ARM_PTE_MASK) |
+ 	    ARM_PTE_TYPE_VALID |
+@@ -910,7 +908,7 @@ arm_kva_to_tte(vm_offset_t va)
+ {
+ 	tt_entry_t *tte1, *tte2;
+ 	tte1 = cpu_tte + L1_TABLE_T1_INDEX(va, TCR_EL1_BOOT);
+-	tte2 = L2_TABLE_VA(tte1) + L2_TABLE_INDEX(va);
++	tte2 = (tt_entry_t *)ttetokv(*tte1) + L2_TABLE_INDEX(va);
+ 
+ 	return tte2;
+ }
+@@ -921,7 +919,7 @@ static inline pt_entry_t *
+ arm_kva_to_pte(vm_offset_t va)
+ {
+ 	tt_entry_t *tte2 = arm_kva_to_tte(va);
+-	return L3_TABLE_VA(tte2) + L3_TABLE_INDEX(va);
++	return (pt_entry_t *)ttetokv(*tte2) + L3_TABLE_INDEX(va);
+ }
+ 
+ #endif
+@@ -1031,7 +1029,7 @@ arm_vm_page_granular_helper(vm_offset_t start, vm_offset_t _end, vm_offset_t va,
+ 
+ 		if (ARM_TTE_TYPE_TABLE == (tmplate & ARM_TTE_TYPE_MASK)) {
+ 			/* pick up the existing page table. */
+-			ppte = (pt_entry_t *)phystokv((tmplate & ARM_TTE_TABLE_MASK));
++			ppte = (pt_entry_t *)ttetokv(tmplate);
+ 		} else {
+ 			// TTE must be reincarnated with page level mappings.
+ 
+@@ -1059,7 +1057,7 @@ arm_vm_page_granular_helper(vm_offset_t start, vm_offset_t _end, vm_offset_t va,
+ 		/* Apply the desired protections to the specified page range */
+ 		for (i = 0; i <= (ARM_TT_L3_INDEX_MASK >> ARM_TT_L3_SHIFT); i++) {
+ 			if ((start <= va) && (va < rounded_end)) {
+-				ptmp = pa | ARM_PTE_AF | ARM_PTE_SH(SH_OUTER_MEMORY) | ARM_PTE_TYPE_VALID;
++				ptmp = pa_to_pte(pa) | ARM_PTE_AF | ARM_PTE_SH(SH_OUTER_MEMORY) | ARM_PTE_TYPE_VALID;
+ 				ptmp = ptmp | ARM_PTE_ATTRINDX(CACHE_ATTRINDX_DEFAULT);
+ 				ptmp = ptmp | ARM_PTE_AP(pte_prot_APX);
+ 				ptmp = ptmp | ARM_PTE_NX;
+@@ -1129,6 +1127,10 @@ arm_vm_page_granular_prot(vm_offset_t start, unsigned long size, pmap_paddr_t pa
+ 	vm_offset_t _end = start + size;
+ 	vm_offset_t align_start = (start + ARM_TT_L2_OFFMASK) & ~ARM_TT_L2_OFFMASK;
+ 
++	if (linux64_phys_map.n_chunks) {
++		granule &= ~(ARM64_GRANULE_ALLOW_BLOCK | ARM64_GRANULE_ALLOW_HINT);
++	}
++
+ 	if (size == 0x0UL) {
+ 		return;
+ 	}
+@@ -1152,7 +1154,7 @@ arm_vm_page_granular_prot(vm_offset_t start, unsigned long size, pmap_paddr_t pa
+ 			tte2 = arm_kva_to_tte(align_start);
+ 
+ 			if ((pa >= gPhysBase) && (pa < real_avail_end)) {
+-				tmplate = (pa & ARM_TTE_BLOCK_L2_MASK) | ARM_TTE_TYPE_BLOCK
++				tmplate = (linux64_gpa_to_hpa(pa) & ARM_TTE_BLOCK_L2_MASK) | ARM_TTE_TYPE_BLOCK
+ 				    | ARM_TTE_VALID | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_NX
+ 				    | ARM_TTE_BLOCK_AP(pte_prot_APX) | ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY)
+ 				    | ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITEBACK);
+@@ -1811,7 +1813,7 @@ init_ptpages(tt_entry_t *tt, vm_map_address_t start, vm_map_address_t end, bool
+ 		if (*l1_tte == ARM_TTE_EMPTY) {
+ 			/* Allocate a page and setup L1 Table TTE in L1 */
+ 			ptpage_vaddr = alloc_ptpage(static_map);
+-			*l1_tte = (kvtophys(ptpage_vaddr) & ARM_TTE_TABLE_MASK) | ARM_TTE_TYPE_TABLE | ARM_TTE_VALID | table_attrs;
++			*l1_tte = pa_to_tte(kvtophys(ptpage_vaddr)) | ARM_TTE_TYPE_TABLE | ARM_TTE_VALID | table_attrs;
+ 			bzero((void *)ptpage_vaddr, ARM_PGBYTES);
+ 		}
+ 
+@@ -2162,9 +2164,9 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ 	 */
+ 	va_l1 = va_l2 = LOW_GLOBAL_BASE_ADDRESS;
+ 	cpu_l1_tte = cpu_tte + L1_TABLE_T1_INDEX(va_l1, TCR_EL1_BOOT);
+-	cpu_l2_tte = ((tt_entry_t *) phystokv(((*cpu_l1_tte) & ARM_TTE_TABLE_MASK))) + ((va_l2 & ARM_TT_L2_INDEX_MASK) >> ARM_TT_L2_SHIFT);
++	cpu_l2_tte = ((tt_entry_t *) ttetokv(*cpu_l1_tte)) + ((va_l2 & ARM_TT_L2_INDEX_MASK) >> ARM_TT_L2_SHIFT);
+ 	ptpage_vaddr = alloc_ptpage(TRUE);
+-	*cpu_l2_tte = (kvtophys(ptpage_vaddr) & ARM_TTE_TABLE_MASK) | ARM_TTE_TYPE_TABLE | ARM_TTE_VALID | ARM_TTE_TABLE_PXN | ARM_TTE_TABLE_XN;
++	*cpu_l2_tte = pa_to_tte(kvtophys(ptpage_vaddr)) | ARM_TTE_TYPE_TABLE | ARM_TTE_VALID | ARM_TTE_TABLE_PXN | ARM_TTE_TABLE_XN;
+ 	bzero((void *)ptpage_vaddr, ARM_PGBYTES);
+ 
+ 	/*
+@@ -2305,11 +2307,11 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ 		dynamic_memory_begin += ARM_TT_L2_SIZE;
+ 		cpu_l1_tte = cpu_tte + L1_TABLE_T1_INDEX(ctrr_test_page, TCR_EL1_BOOT);
+ 		assert((*cpu_l1_tte) & ARM_TTE_VALID);
+-		cpu_l2_tte = ((tt_entry_t *) phystokv(((*cpu_l1_tte) & ARM_TTE_TABLE_MASK))) + ((ctrr_test_page & ARM_TT_L2_INDEX_MASK) >> ARM_TT_L2_SHIFT);
++		cpu_l2_tte = ((tt_entry_t *) ttetokv(*cpu_l1_tte)) + ((ctrr_test_page & ARM_TT_L2_INDEX_MASK) >> ARM_TT_L2_SHIFT);
+ 		assert((*cpu_l2_tte) == ARM_TTE_EMPTY);
+ 		new_tte = (tt_entry_t *)alloc_ptpage(FALSE);
+ 		bzero(new_tte, ARM_PGBYTES);
+-		*cpu_l2_tte = (kvtophys((vm_offset_t)new_tte) & ARM_TTE_TABLE_MASK) | ARM_TTE_TYPE_TABLE | ARM_TTE_VALID;
++		*cpu_l2_tte = pa_to_tte(kvtophys((vm_offset_t)new_tte)) | ARM_TTE_TYPE_TABLE | ARM_TTE_VALID;
+ 	}
+ #endif /* (defined(KERNEL_INTEGRITY_CTRR) || defined(KERNEL_INTEGRITY_PV_CTRR)) && defined(CONFIG_XNUPOST) */
+ #if XNU_MONITOR
+@@ -2352,7 +2354,7 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ 			va_l2_end = MIN((va_l1 & ~ARM_TT_L1_OFFMASK) + ARM_TT_L1_SIZE, va_l1_end);
+ 		}
+ 
+-		cpu_l2_tte = ((tt_entry_t *) phystokv(((*cpu_l1_tte) & ARM_TTE_TABLE_MASK))) + ((va_l2 & ARM_TT_L2_INDEX_MASK) >> ARM_TT_L2_SHIFT);
++		cpu_l2_tte = ((tt_entry_t *) ttetokv(*cpu_l1_tte)) + ((va_l2 & ARM_TT_L2_INDEX_MASK) >> ARM_TT_L2_SHIFT);
+ 
+ 		while (va_l2 < va_l2_end) {
+ 			pt_entry_t *    ptp;
+@@ -2414,7 +2416,7 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ 			va_l2_end = MIN((va_l1 & ~ARM_TT_L1_OFFMASK) + ARM_TT_L1_SIZE, va_l1_end);
+ 		}
+ 
+-		cpu_l2_tte = ((tt_entry_t *) phystokv(((*cpu_l1_tte) & ARM_TTE_TABLE_MASK))) + ((va_l2 & ARM_TT_L2_INDEX_MASK) >> ARM_TT_L2_SHIFT);
++		cpu_l2_tte = ((tt_entry_t *) ttetokv(*cpu_l1_tte)) + ((va_l2 & ARM_TT_L2_INDEX_MASK) >> ARM_TT_L2_SHIFT);
+ 
+ 		while (va_l2 < va_l2_end) {
+ 			pt_entry_t *    ptp;
+diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
+index b66afca..5ff618b 100644
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -469,6 +469,10 @@ get_mmu_ttb(void)
+ 	pmap_paddr_t    value;
+ 
+ 	MRS(value, "TTBR0_EL1");
++	if (__improbable(linux64_phys_map.n_chunks)) {
++		uint64_t baddr = value & ARM_TTE_TABLE_MASK;
++		value = (value & ~ARM_TTE_TABLE_MASK) | linux64_hpa_to_gpa(baddr);
++	}
+ 	return value;
+ }
+ 
+@@ -2075,7 +2079,7 @@ ml_static_protect(
+ 				break;
+ 			}
+ 
+-			pte_p = (pt_entry_t *)&((tt_entry_t*)(phystokv((*tte2) & ARM_TTE_TABLE_MASK)))[(((vaddr_cur) & ARM_TT_L3_INDEX_MASK) >> ARM_TT_L3_SHIFT)];
++			pte_p = (pt_entry_t *)&((tt_entry_t*)(ttetokv(*tte2)))[(((vaddr_cur) & ARM_TT_L3_INDEX_MASK) >> ARM_TT_L3_SHIFT)];
+ 			ptmp = *pte_p;
+ 
+ 			if ((ptmp & ARM_PTE_HINT_MASK) && ((ptmp & (ARM_PTE_APMASK | ARM_PTE_PNXMASK | ARM_PTE_NXMASK)) != arm_prot)) {
+diff --git a/osfmk/arm64/machine_routines_asm.s b/osfmk/arm64/machine_routines_asm.s
+index 445ce31..e70970d 100644
+--- a/osfmk/arm64/machine_routines_asm.s
++++ b/osfmk/arm64/machine_routines_asm.s
+@@ -418,7 +418,7 @@ LEXT(mmu_kvtop)
+ 	tbnz	x1, #0, L_mmu_kvtop_invalid					// Test Translation not valid
+ 	bfm		x1, x0, #0, #11								// Add page offset
+ 	and		x0, x1, #0x0000ffffffffffff					// Clear non-address bits 
+-	ret
++	b		EXT(linux64_hpa_to_gpa)
+ L_mmu_kvtop_invalid:
+ 	mov		x0, #0										// Return invalid
+ 	ret
+@@ -442,7 +442,7 @@ LEXT(mmu_uvtop)
+ 	tbnz	x1, #0, L_mmu_uvtop_invalid					// Test Translation not valid
+ 	bfm		x1, x0, #0, #11								// Add page offset
+ 	and		x0, x1, #0x0000ffffffffffff					// Clear non-address bits 
+-	ret
++	b		EXT(linux64_hpa_to_gpa)
+ L_mmu_uvtop_invalid:
+ 	mov		x0, #0										// Return invalid
+ 	ret
+@@ -464,7 +464,7 @@ LEXT(mmu_kvtop_wpreflight)
+ 	tbnz	x1, #0, L_mmu_kvtop_wpreflight_invalid		// Test Translation not valid
+ 	bfm		x1, x0, #0, #11								// Add page offset
+ 	and		x0, x1, #0x0000ffffffffffff					// Clear non-address bits
+-	ret
++	b		EXT(linux64_hpa_to_gpa)
+ L_mmu_kvtop_wpreflight_invalid:
+ 	mov		x0, #0										// Return invalid
+ 	ret

@@ -1,0 +1,96 @@
+From 82edd4c52e108ff8a013289786374121b042f64d Mon Sep 17 00:00:00 2001
+From: dere3046 <fine4trn@163.com>
+Date: Tue, 24 Nov 2026 23:33:18 +0800
+Subject: [PATCH 1/3] linux64: add s1pie pte bit
+
+---
+ EXTERNAL_HEADERS/linux64/linux64.h |  1 +
+ osfmk/arm/arm_init.c               |  5 +++++
+ osfmk/arm/pmap/pmap.c              | 19 +++++++++++++++++++
+ 3 files changed, 25 insertions(+)
+
+diff --git a/EXTERNAL_HEADERS/linux64/linux64.h b/EXTERNAL_HEADERS/linux64/linux64.h
+index 1d58c15..549fb09 100644
+--- a/EXTERNAL_HEADERS/linux64/linux64.h
++++ b/EXTERNAL_HEADERS/linux64/linux64.h
+@@ -35,6 +35,7 @@ extern "C" {
+  */
+ extern unsigned long linux64_hook;
+ extern unsigned long linux64_slide;
++extern unsigned int linux64_s1pie;
+ 
+ /* This CPU's slot in the per-CPU arrays (LINUX64_CPU_SLOT of its MPIDR): valid before XNU knows its cpu number */
+ static inline unsigned
+diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
+index c3d8f3f..3887905 100644
+--- a/osfmk/arm/arm_init.c
++++ b/osfmk/arm/arm_init.c
+@@ -232,6 +232,7 @@ extern vm_offset_t segLOWESTRXAuxKC, segHIGHESTRXAuxKC, segHIGHESTNLEAuxKC;
+ /* LINUX64 (xnulinux): the hosted machine layer's state (linux64/linux64.h), set by xnu.ko before arm_init */
+ uintptr_t linux64_hook;
+ uintptr_t linux64_slide;
++unsigned int linux64_s1pie;
+ unsigned int linux64_vint[LINUX64_CPU_SLOTS];
+ unsigned int linux64_ipi_pending[LINUX64_CPU_SLOTS];
+ unsigned long linux64_dbg[LINUX64_NCOUNTERS];
+@@ -472,9 +473,13 @@ arm_init(
+ 		 */
+ 		{
+ 			uint32_t vm16k = 0;
++			uint32_t s1pie = 0;
+ 			if (linux64_hook && PE_parse_boot_argn("linux64_vm16k", &vm16k, sizeof(vm16k)) && vm16k) {
+ 				PAGE_SHIFT_CONST = PAGE_MAX_SHIFT;
+ 			}
++			if (linux64_hook && PE_parse_boot_argn("linux64_s1pie", &s1pie, sizeof(s1pie)) && s1pie) {
++				linux64_s1pie = 1;
++			}
+ 		}
+ #else
+ 		/*
+diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
+index 2acc959..d085730 100644
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -58,6 +58,7 @@
+ #include <vm/vm_object_internal.h>
+ #include <vm/vm_page_internal.h>
+ #include <vm/vm_pageout.h>
++#include <linux64/linux64.h>
+ #include <vm/cpm_internal.h>
+ 
+ #include <libkern/img4/interface.h>
+@@ -701,9 +702,25 @@ pte_is_xs(const pt_attr_t *pt_attr, pt_entry_t pte)
+  *            in this value will automatically be incremented for each PTE
+  *            write.
+  */
++static inline pt_entry_t
++linux64_s1pie_pte(pt_entry_t pte)
++{
++	/* Linux S1PIE needs bit 51 set on writable leaves and clear on read only */
++	if (__improbable(linux64_s1pie) && (pte & ARM_PTE_TYPE_VALID) &&
++	    (pte & ARM_PTE_AF)) {
++		if (!(pte & ARM_PTE_AP(2))) {
++			pte |= (1ULL << 51);
++		} else {
++			pte &= ~(1ULL << 51);
++		}
++	}
++	return pte;
++}
++
+ static void
+ write_pte_fast(pt_entry_t *ptep, pt_entry_t pte)
+ {
++	pte = linux64_s1pie_pte(pte);
+ 	/**
+ 	 * The PAGE_SHIFT (and in turn, the PAGE_RATIO) can be a variable on some
+ 	 * systems, which is why it's checked at runtime instead of compile time.
+@@ -5971,6 +5988,8 @@ pmap_enter_pte(pmap_t pmap, pt_entry_t *pte_p, pt_entry_t *old_pte, pt_entry_t n
+ 	const pt_attr_t * const pt_attr = pmap_get_pt_attr(pmap);
+ 	bool success = false, changed_wiring = false;
+ 
++	new_pte = linux64_s1pie_pte(new_pte);
++
+ 	__unreachable_ok_push
+ 	if (TEST_PAGE_RATIO_4) {
+ 		/*

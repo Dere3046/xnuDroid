@@ -95,6 +95,15 @@ struct xnu_ctx {
 
 	struct xnu_image img;
 	struct fki_region l2page;
+	struct fki_chunk *m4_chunks;
+	struct fki_region *m4_l3pages;
+	struct linux64_h2g_slot *m4_h2g;
+	unsigned int *m4_g2h;
+	unsigned int m4_n_chunks;
+	unsigned int m4_n_l3;
+	unsigned int m4_hash_mask;
+	u64_t m4_gpa_base;
+	u64_t m4_map_reserve;
 	unsigned long long *window_slot;
 	unsigned long long *window_l1;
 	unsigned char window_owned[512];

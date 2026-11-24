@@ -14,6 +14,24 @@
 
 #define LINUX64_ABI_VERSION 3
 
+#define LINUX64_CHUNK_SHIFT 14
+#define LINUX64_CHUNK_SIZE  (1ULL << LINUX64_CHUNK_SHIFT)
+#define LINUX64_CHUNK_MASK  (~(LINUX64_CHUNK_SIZE - 1))
+
+struct linux64_h2g_slot {
+	__UINT32_TYPE__ hpa_tag;	/* shifted hpa plus one */
+	__UINT32_TYPE__ chunk_idx;
+};
+
+struct linux64_phys_map {
+	__UINT64_TYPE__ gpa_base;
+	__UINT64_TYPE__ gpa_end;
+	const __UINT32_TYPE__ *g2h;	/* shifted hpa per 16k chunk */
+	const struct linux64_h2g_slot *h2g;
+	__UINT32_TYPE__ n_chunks;
+	__UINT32_TYPE__ hash_mask;
+};
+
 enum linux64_call {
 	LINUX64_CALL_KERNEL_TABLES = 210,
 	LINUX64_CALL_IDLE = 810,

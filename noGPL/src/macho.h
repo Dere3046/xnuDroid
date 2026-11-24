@@ -127,7 +127,7 @@ struct chained_fixups_hdr {
 
 struct chained_starts_in_image {
 	u32_t seg_count;
-	u32_t seg_info_offset[1];
+	u32_t seg_info_offset[];
 };
 
 struct chained_starts_in_segment {
@@ -137,7 +137,7 @@ struct chained_starts_in_segment {
 	u64_t segment_offset;
 	u32_t max_valid_pointer;
 	unsigned short page_count;
-	unsigned short page_start[1];
+	unsigned short page_start[];
 };
 
 int macho_load(struct xnu_image *img, const void *file, unsigned long size,

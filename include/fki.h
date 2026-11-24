@@ -24,6 +24,13 @@ struct fki_region {
 	void *handle;
 };
 
+struct fki_chunk {
+	fki_u64 pa;
+	void *va;
+	void *handle;
+	unsigned int kind;
+};
+
 struct fki_pac_keys {
 	fki_u64 ia[2];
 	fki_u64 ib[2];
@@ -52,6 +59,10 @@ int fki_region_alloc(unsigned long size, struct fki_region *r);
 void fki_region_free(struct fki_region *r);
 int fki_contig_alloc(unsigned long size, struct fki_region *r);
 void fki_contig_free(struct fki_region *r);
+int fki_chunk_alloc_16k(unsigned long count, struct fki_chunk *chunks);
+void fki_chunk_free_16k(unsigned long count, struct fki_chunk *chunks);
+void *fki_valloc(unsigned long size);
+void fki_vfree(const void *addr);
 
 int fki_blob_get(const char *name, const void **data, unsigned long *size,
 		 void **handle);
@@ -113,6 +124,10 @@ long fki_file_pwrite(void *file, const void *buf, unsigned long len,
 
 long fki_hostcall(const void *req, unsigned long len, void *reply,
 		  unsigned long max);
+
+long fki_console_write(const char *buf, unsigned long len);
+long fki_console_read(char *buf, unsigned long len);
+int fki_console_open_count(void);
 
 unsigned long fki_kr_resolve(const char *name);
 int fki_kr_addr_name(unsigned long addr, char *buf, int max);

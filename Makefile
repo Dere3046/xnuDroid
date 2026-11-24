@@ -12,6 +12,7 @@ fki-y := src/core/fki_main.o \
 	 src/core/fki_cpu.o \
 	 src/core/fki_io.o \
 	 src/core/fki_hostcall.o \
+	 src/core/fki_console.o \
 	 src/hook/fki_hook.o \
 	 src/tool/sym_reg.o \
 	 $(DEPS_OBJS_ALL)

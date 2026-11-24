@@ -1,0 +1,34 @@
+From 385d9cb54a78f9b126ce42120796a085d40e3d42 Mon Sep 17 00:00:00 2001
+From: dere3046 <fine4trn@163.com>
+Date: Tue, 24 Nov 2026 23:33:18 +0800
+Subject: [PATCH 3/3] linux64: align user stack 16
+
+---
+ bsd/kern/kern_exec.c | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 3777cc5..1e8d67f 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -6620,13 +6620,19 @@ exec_copyout_strings(struct image_params *imgp, user_addr_t *stackp)
+ 	/* Grow the stack down for the strings we've been building up */
+ 	string_size = imgp->ip_strendp - imgp->ip_strings;
+ 	stack -= string_size;
+-	string_area = stack;
+ 
+ 	/*
+ 	 * Need room for one pointer for each string, plus
+ 	 * one for the NULLs terminating the argv, envv, and apple areas.
+ 	 */
+ 	ptr_area_size = (imgp->ip_argc + imgp->ip_envc + imgp->ip_applec + 3) * ptr_size;
++	if (ptr_size == 8) {
++		user_addr_t align_rem = (stack - ptr_area_size - ptr_size) & 0xfULL;
++		if (align_rem) {
++			stack -= align_rem;
++		}
++	}
++	string_area = stack;
+ 	stack -= ptr_area_size;
+ 	ptr_area = stack;
+ 

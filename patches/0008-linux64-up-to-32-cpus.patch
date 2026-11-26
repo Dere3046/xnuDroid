@@ -1,0 +1,82 @@
+From dc73752b75c6162c99e585b9a06f3d52928d10af Mon Sep 17 00:00:00 2001
+From: dere3046 <fine4trn@163.com>
+Date: Fri, 27 Nov 2026 00:29:19 +0800
+Subject: [PATCH] linux64: up to 32 cpus
+
+---
+ EXTERNAL_HEADERS/linux64/linux64_abi.h | 6 ++++--
+ osfmk/arm64/machine_routines.c         | 9 +++++----
+ pexpert/pexpert/arm64/board_config.h   | 2 +-
+ 3 files changed, 10 insertions(+), 7 deletions(-)
+
+diff --git a/EXTERNAL_HEADERS/linux64/linux64_abi.h b/EXTERNAL_HEADERS/linux64/linux64_abi.h
+index e6b0bf6..c44fed4 100644
+--- a/EXTERNAL_HEADERS/linux64/linux64_abi.h
++++ b/EXTERNAL_HEADERS/linux64/linux64_abi.h
+@@ -115,13 +115,15 @@ struct linux64_input_event {
+ #define LINUX64_CPU_SLOTS 256
+ #define LINUX64_CPU_SLOT(mpidr) ((unsigned)(((mpidr) & 0xf) | (((mpidr) >> 4) & 0xf0)))
+ 
++#define LINUX64_MAX_CPUS 32
++
+ /*
+  * linux64_el0_stat[cpu][0][class]: exceptions taken from user space, by class; [cpu][1][class]: counter ticks from
+  * taking one until the CPU next enters user space (blocking included). Classes: SVC, data abort, instruction abort,
+- * host IRQ, other. By XNU CPU number (cpu_number() & (LINUX64_EL0_CPUS - 1)): small, the kernel's data must not grow.
++ * host IRQ, other. By XNU CPU number (cpu_number() & (LINUX64_EL0_CPUS - 1)).
+  */
+ #define LINUX64_EL0_CLASSES 5
+-#define LINUX64_EL0_CPUS 8
++#define LINUX64_EL0_CPUS LINUX64_MAX_CPUS
+ 
+ enum linux64_counter {
+ 	LINUX64_CTR_IDLE_THREAD  = 0,	/* XNU's idle thread loops */
+diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
+index 50d208e..c7ca20b 100644
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -1528,6 +1528,7 @@ ml_get_first_cpu_id(unsigned int cluster_id)
+ }
+ 
+ static_assert(MAX_CPUS <= 256, "MAX_CPUS must fit in _COMM_PAGE_CPU_TO_CLUSTER; Increase table size if needed");
++static_assert(MAX_CPUS >= LINUX64_MAX_CPUS, "MAX_CPUS (board_config.h) is below LINUX64_MAX_CPUS (linux64_abi.h)");
+ 
+ void
+ ml_map_cpus_to_clusters(uint8_t *table)
+@@ -1691,16 +1692,16 @@ ml_processor_register(ml_processor_info_t *in_processor_info,
+     processor_t *processor_out, ipi_handler_t *ipi_handler_out,
+     perfmon_interrupt_handler_func *pmi_handler_out)
+ {
++	if (in_processor_info->log_id > (uint32_t)ml_get_max_cpu_number()) {
++		return KERN_FAILURE;
++	}
++
+ 	cpu_data_t *this_cpu_datap = cpu_datap(in_processor_info->log_id);
+ 	assert3u(this_cpu_datap->cpu_number, ==, in_processor_info->log_id); /* from ml_bootstrap_processors() */
+ 
+ 	boolean_t  is_boot_cpu     = (in_processor_info->log_id == ml_get_boot_cpu_number());
+ 	static unsigned int reg_cpu_count = 0;
+ 
+-	if (in_processor_info->log_id > (uint32_t)ml_get_max_cpu_number()) {
+-		return KERN_FAILURE;
+-	}
+-
+ 	if ((unsigned)OSIncrementAtomic((SInt32*)&reg_cpu_count) >= topology_info.num_cpus) {
+ 		return KERN_FAILURE;
+ 	}
+diff --git a/pexpert/pexpert/arm64/board_config.h b/pexpert/pexpert/arm64/board_config.h
+index 69f6787..6f12803 100644
+--- a/pexpert/pexpert/arm64/board_config.h
++++ b/pexpert/pexpert/arm64/board_config.h
+@@ -308,7 +308,7 @@
+ #include <pexpert/arm64/BCM2837.h>
+ 
+ #define MAX_L2_CLINE                   6
+-#define MAX_CPUS                       8 /* SM8550 (sheng) and SM8350 (zeta) have eight cores */
++#define MAX_CPUS                       32 /* LINUX64: matches LINUX64_MAX_CPUS in linux64_abi.h */
+ /*
+  * Two clusters: the device tree's cpus carry cluster-type 'E' or 'P' from the host's cpu capacities (make-droidvm-adt.py; all
+  * 'P' when the host gives every vCPU the same). The AMP scheduler (sched_amp, not Edge: Edge places threads by CLPC's thread group
+-- 
+2.54.0
+

@@ -1,0 +1,45 @@
+From f240e714163492ffac289f3b4c373aace0519130 Mon Sep 17 00:00:00 2001
+From: dere3046 <fine4trn@163.com>
+Date: Fri, 27 Nov 2026 00:29:19 +0800
+Subject: [PATCH] linux64: vfork as fork
+
+---
+ bsd/kern/kern_fork.c     | 8 ++++++++
+ bsd/kern/syscalls.master | 2 +-
+ 2 files changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/bsd/kern/kern_fork.c b/bsd/kern/kern_fork.c
+index 1d8db27..3f089fa 100644
+--- a/bsd/kern/kern_fork.c
++++ b/bsd/kern/kern_fork.c
+@@ -631,6 +631,14 @@ fork(proc_t parent_proc, __unused struct fork_args *uap, int32_t *retval)
+ 	return err;
+ }
+ 
++#if !CONFIG_VFORK
++int
++sys_vfork(proc_t parent_proc, __unused struct vfork_args *uap, int32_t *retval)
++{
++	return fork(parent_proc, NULL, retval);
++}
++#endif
++
+ 
+ /*
+  * cloneproc
+diff --git a/bsd/kern/syscalls.master b/bsd/kern/syscalls.master
+index 1e26f75..1cfc919 100644
+--- a/bsd/kern/syscalls.master
++++ b/bsd/kern/syscalls.master
+@@ -120,7 +120,7 @@
+ #if CONFIG_VFORK
+ 66	AUE_VFORK	ALL	{ int vfork(void) NO_SYSCALL_STUB; }
+ #else
+-66	AUE_NULL	ALL	{ int nosys(void); }   { old vfork }
++66	AUE_FORK	ALL	{ int sys_vfork(void); }   { old vfork }
+ #endif
+ 67	AUE_NULL	ALL	{ int oslog_coproc_reg(const char *uuid, const char *file_path, size_t file_path_len) NO_SYSCALL_STUB; }
+ 68	AUE_NULL	ALL	{ int oslog_coproc(void *buff, uint64_t buff_len, uint32_t type, const char *uuid, uint64_t timestamp, uint32_t offset, uint32_t stream_log) NO_SYSCALL_STUB; }
+-- 
+2.54.0
+

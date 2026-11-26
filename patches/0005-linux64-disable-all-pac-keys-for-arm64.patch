@@ -1,0 +1,62 @@
+From 9a0b0b8c461815a169f37ecaef1d90f8f91ead58 Mon Sep 17 00:00:00 2001
+From: dere3046 <fine4trn@163.com>
+Date: Fri, 27 Nov 2026 00:29:19 +0800
+Subject: [PATCH] linux64: disable all pac keys for arm64
+
+---
+ osfmk/arm64/cswitch.s | 11 ++++++++---
+ osfmk/arm64/sleh.c    |  5 +++--
+ 2 files changed, 11 insertions(+), 5 deletions(-)
+
+diff --git a/osfmk/arm64/cswitch.s b/osfmk/arm64/cswitch.s
+index 035b1a8..6928cff 100644
+--- a/osfmk/arm64/cswitch.s
++++ b/osfmk/arm64/cswitch.s
+@@ -507,12 +507,17 @@ LEXT(linux64_el0_run)
+ 	ldr		x10, [x11, TH_CTH_SELF]				// the user's TSD (Darwin reads it from TPIDRRO_EL0)
+ 	msr		TPIDRRO_EL0, x10
+ 	/*
+-	 * x1: JOP off for this thread (arm64, not arm64e): EnIA (31) and EnDA (27) off at EL0. Only after the last
+-	 * kernel pointer authentication (LOAD_KERN_STACK_TOP authenticates; with EnDA off it would trap to brk).
++	 * x1: JOP off for this thread (arm64, not arm64e): all four keys, EnIA (31), EnIB (30), EnDA (27) and EnDB (13),
++	 * off at EL0, as Apple hardware runs such a process. Its return addresses are unsigned, and the arm64e system
++	 * unwinder authenticates each frame's with the IB key: with EnIB on, an exception thrown in an arm64 process
++	 * ends in EXC_ARM_PAC_FAIL. Only after the last kernel pointer authentication (LOAD_KERN_STACK_TOP
++	 * authenticates; with EnDA off it would trap to brk).
+ 	 */
+ 	cbz		x1, 1f
+ 	mrs		x10, SCTLR_EL1
+ 	mov		x11, #((1 << 31) | (1 << 27))
++	orr		x11, x11, #(1 << 30)
++	orr		x11, x11, #(1 << 13)
+ 	bic		x10, x10, x11
+ 	msr		SCTLR_EL1, x10
+ 1:
+@@ -631,7 +636,7 @@ Llinux64_el0_common:
+ 	ldr		x10, [x9, #16]
+ 	msr		VBAR_EL1, x10
+ 	ldr		x18, [x9, #24]						// the host's x18 again (user code owns x18 at EL0)
+-	ldr		x10, [x9, #32]						// SCTLR_EL1 as the kernels expect it (EnIA/EnDA back on)
++	ldr		x10, [x9, #32]						// SCTLR_EL1 as the kernels expect it (the keys back on)
+ 	msr		SCTLR_EL1, x10
+ 	isb
+ 	mov		x0, sp
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index fb3ea92..fddd565 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -3766,8 +3766,9 @@ linux64_thread_bootstrap_return(void)
+ 	}
+ 	/*
+ 	 * An arm64 (not arm64e) process runs the arm64e system libraries with JOP off: Apple hardware disables the user
+-	 * IA/DA keys for it; hosted, user code runs with SCTLR_EL1.EnIA/EnDA cleared (linux64_el0_run puts them back on
+-	 * the next exception), or a blraaz on one of its unsigned function pointers fails (EXC_ARM_PAC_FAIL).
++	 * keys for it; hosted, user code runs with SCTLR_EL1.EnIA/EnIB/EnDA/EnDB cleared (linux64_el0_run puts them back
++	 * on the next exception), or a blraaz on one of its unsigned function pointers, or the unwinder's autib of one of
++	 * its unsigned return addresses, fails (EXC_ARM_PAC_FAIL).
+ 	 */
+ #if PRECISE_USER_KERNEL_TIME
+ 	recount_enter_user();		/* user time vs system time, as locore's return to user space does */
+-- 
+2.54.0
+

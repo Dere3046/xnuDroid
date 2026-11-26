@@ -1,0 +1,66 @@
+From 41d5bcb6dfb9cbf264583d5b3a7dbd94475102d9 Mon Sep 17 00:00:00 2001
+From: dere3046 <fine4trn@163.com>
+Date: Fri, 27 Nov 2026 00:29:19 +0800
+Subject: [PATCH] linux64: host ram cache halt and timers
+
+---
+ EXTERNAL_HEADERS/linux64/linux64_abi.h | 1 +
+ osfmk/arm/pmap/pmap.c                  | 5 ++++-
+ osfmk/arm64/machine_routines.c         | 6 ++++++
+ 3 files changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/EXTERNAL_HEADERS/linux64/linux64_abi.h b/EXTERNAL_HEADERS/linux64/linux64_abi.h
+index 44dab90..e6b0bf6 100644
+--- a/EXTERNAL_HEADERS/linux64/linux64_abi.h
++++ b/EXTERNAL_HEADERS/linux64/linux64_abi.h
+@@ -59,6 +59,7 @@ enum linux64_call {
+ 	LINUX64_CALL_HOSTCALL       = 830,	/* a1 = struct linux64_hostcall_req: a message to a Linux service and its reply */
+ 	LINUX64_CALL_CPU_START      = 840,	/* a1 = a CPU's MPIDR, a2 = its cpu_data_t: the host enters linux64_cpu_entry(a2) there */
+ 	LINUX64_CALL_IPI            = 841,	/* a1 = the target CPU's MPIDR: its linux64_ipi_pending slot is set; make it look */
++	LINUX64_CALL_HALT           = 992,	/* a1 = 1 restart, 0 halt: the hosted system shut down (halt_all_cpus); the run ends */
+ 	LINUX64_CALL_CONSOLE_READ   = 993,	/* a1 = struct linux64_buf_req: console input bytes */
+ 	LINUX64_CALL_RAMDISK_RW     = 994,	/* a1 = struct linux64_rw_req on the host-file md disk */
+ 	LINUX64_CALL_RAMDISK_SIZE   = 995,	/* a1 = u64 *: the host-file md disk's size, 0 when there is none */
+diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
+index 462f878..c59a8f1 100644
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -10689,7 +10689,10 @@ pmap_cache_attributes(
+ 
+ 	if (!pa_valid(paddr)) {
+ 		pmap_io_range_t *io_rgn = pmap_find_io_attr(paddr);
+-		return (io_rgn == NULL) ? VM_WIMG_IO : io_rgn->wimg;
++		if (io_rgn != NULL) {
++			return io_rgn->wimg;
++		}
++		return linux64_hook ? VM_WIMG_DEFAULT : VM_WIMG_IO;
+ 	}
+ 
+ 	result = VM_WIMG_DEFAULT;
+diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
+index 5ff618b..1d56550 100644
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -953,6 +953,9 @@ halt_all_cpus(boolean_t reboot)
+ 		printf("CPU halted\n");
+ 		PEHaltRestart(kPEHaltCPU);
+ 	}
++	if (linux64_hook) {
++		linux64_call2(LINUX64_CALL_HALT, reboot ? 1 : 0, 0);
++	}
+ 	while (1) {
+ 		;
+ 	}
+@@ -2809,6 +2812,9 @@ _enable_virtual_timer(void)
+ void
+ fiq_context_init(boolean_t enable_fiq __unused)
+ {
++	if (linux64_hook) {
++		return;
++	}
+ 	/* Interrupts still disabled. */
+ 	assert(ml_get_interrupts_enabled() == FALSE);
+ 	_enable_virtual_timer();
+-- 
+2.54.0
+

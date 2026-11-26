@@ -1,0 +1,75 @@
+From 8628b04abd0c31ccf584da057af7cf2e1a7e7a01 Mon Sep 17 00:00:00 2001
+From: dere3046 <fine4trn@163.com>
+Date: Fri, 27 Nov 2026 00:29:19 +0800
+Subject: [PATCH] linux64: physmap below the kernel
+
+---
+ osfmk/arm64/arm_vm_init.c      | 15 +++++++++++++++
+ osfmk/arm64/machine_routines.c |  4 ++++
+ 2 files changed, 19 insertions(+)
+
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index 1a39493..2dc9dbc 100644
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -1883,6 +1883,9 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ 	physmap_base = VM_MIN_KERNEL_ADDRESS - (physmap_l1_entries << ARM_TT_L1_SHIFT);
+ #else
+ 	physmap_base = phystokv(args->topOfKernelData);
++	if (linux64_hook) {
++		physmap_base = VM_MIN_KERNEL_ADDRESS;
++	}
+ #endif
+ 
+ 	// Slide the physical aperture to a random page-aligned location within the slide range
+@@ -1914,6 +1917,13 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ #else
+ 	static_memory_end = physmap_base + mem_size + (PTOV_TABLE_SIZE * ARM_TT_TWIG_SIZE); // worst possible case for block alignment
+ 	physmap_end = physmap_base + real_phys_size + (PTOV_TABLE_SIZE * ARM_TT_TWIG_SIZE);
++	if (linux64_hook) {
++		static_memory_end = phystokv(args->topOfKernelData);
++		if (physmap_end > LOW_GLOBAL_BASE_ADDRESS) {
++			panic("LINUX64: no room below the kernel for a physical aperture of %llu MiB",
++			    (unsigned long long)(real_phys_size >> 20));
++		}
++	}
+ #endif // ARM_LARGE_MEMORY
+ #endif
+ 
+@@ -2011,6 +2021,11 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ 	 */
+ 	init_ptpages(cpu_tte, physmap_base, ROUND_L1(physmap_end), TRUE, ARM_DYNAMIC_TABLE_XN | ARM_TTE_TABLE_AP(ARM_TTE_TABLE_AP_USER_NA));
+ 	port_crumb = 33;
++#else
++	if (linux64_hook) {
++		init_ptpages(cpu_tte, physmap_base, ROUND_L1(physmap_end), TRUE,
++		    ARM_DYNAMIC_TABLE_XN | ARM_TTE_TABLE_AP(ARM_TTE_TABLE_AP_USER_NA));
++	}
+ #endif
+ 
+ 
+diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
+index 1d56550..50d208e 100644
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -141,6 +141,7 @@ extern vm_offset_t   vm_kernelcache_top;
+ 
+ /* Location of the physmap / physical aperture */
+ extern uint64_t physmap_base;
++extern vm_offset_t static_memory_end;
+ 
+ #if defined(CONFIG_SPTM)
+ extern const arm_physrange_t *arm_vm_kernelcache_ranges;
+@@ -2210,6 +2211,9 @@ ml_static_mfree(
+ 	if (vaddr < physmap_base) {
+ 		return;
+ 	}
++	if (linux64_hook && vaddr >= gVirtBase && vaddr < static_memory_end) {
++		return;
++	}
+ 
+ 	assert((vaddr & (PAGE_SIZE - 1)) == 0); /* must be page aligned */
+ 
+-- 
+2.54.0
+

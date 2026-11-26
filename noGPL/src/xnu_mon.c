@@ -223,7 +223,7 @@ static int monitor_fn(void *arg)
 			}
 		}
 		if (g_xnu.perf && g_xnu.cpus > 1) {
-			char cb[200];
+			static char cb[16 + XNU_MAX_CPUS * 42];
 			char *cp = cb;
 
 			put_str(&cp, "xnu: calls");

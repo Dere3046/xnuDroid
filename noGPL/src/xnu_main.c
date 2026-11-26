@@ -12,7 +12,7 @@
 #include "xnu_mon.h"
 #include "xnu_upcall.h"
 
-struct xnu_world xnu_W;
+struct xnu_world g_world;
 struct xnu_world *xnu_worlds[LINUX64_CPU_SLOTS];
 struct xnu_world g_worlds[XNU_MAX_CPUS];
 
@@ -61,6 +61,9 @@ module_param_named(boot_uuid, g_xnu.boot_uuid, charp, 0444);
 module_param_named(preboot_uuid, g_xnu.preboot_uuid, charp, 0444);
 module_param_named(root_uuid, g_xnu.root_uuid, charp, 0444);
 module_param_named(model, g_xnu.model, charp, 0444);
+module_param_named(soc_name, g_xnu.soc_name, charp, 0444);
+module_param_named(gpu_model, g_xnu.gpu_model, charp, 0444);
+module_param_named(ecpus, g_xnu.ecpus, ulong, 0444);
 module_param_named(vm16k, g_xnu.vm16k, int, 0444);
 module_param_named(park_secondaries, g_xnu.park_secondaries, int, 0444);
 module_param_named(perf, g_xnu.perf, int, 0644);
@@ -85,6 +88,71 @@ void xnu_logkv(const char *key, u64_t val)
 	}
 	*ptr = 0;
 	xnu_logs(buf);
+}
+
+#define XNU_STOP_COMMIT 0x10000U
+
+static volatile unsigned g_stop_state;
+
+static inline int stop_cas(unsigned old, unsigned new_val)
+{
+	unsigned cur;
+	unsigned fail;
+
+	__asm__ volatile(
+		"1:	ldaxr	%w[cur], [%[p]]\n"
+		"	cmp	%w[cur], %w[old]\n"
+		"	b.ne	2f\n"
+		"	stlxr	%w[fail], %w[new], [%[p]]\n"
+		"	cbnz	%w[fail], 1b\n"
+		"2:"
+		: [cur] "=&r"(cur), [fail] "=&r"(fail)
+		: [p] "r"(&g_stop_state), [old] "r"(old), [new] "r"(new_val)
+		: "cc", "memory");
+	return cur == old;
+}
+
+void xnu_stop_commit(void)
+{
+	unsigned s;
+
+	do {
+		s = g_stop_state;
+	} while (!(s & XNU_STOP_COMMIT) && !stop_cas(s, s | XNU_STOP_COMMIT));
+}
+
+int xnu_stop_park(void)
+{
+	unsigned s;
+	unsigned in_xnu_cpus = 1;
+	u64_t end;
+	int c;
+
+	for (c = 1; c < g_xnu.cpus; c++) {
+		if (g_xnu.cpu_running[c] != 0) {
+			in_xnu_cpus++;
+		}
+	}
+	do {
+		s = g_stop_state;
+		if (s & XNU_STOP_COMMIT) {
+			return 1;
+		}
+	} while (!stop_cas(s, s + 1));
+	end = fki_counter() + fki_counter_frequency() / 500;
+	for (;;) {
+		s = g_stop_state;
+		if (s & XNU_STOP_COMMIT) {
+			return 1;
+		}
+		if ((s & (XNU_STOP_COMMIT - 1)) >= in_xnu_cpus) {
+			stop_cas(s, s | XNU_STOP_COMMIT);
+			continue;
+		}
+		if (fki_counter() > end && stop_cas(s, s - 1)) {
+			return 0;
+		}
+	}
 }
 
 static int cpu_fn(void *arg)
@@ -113,6 +181,7 @@ static int cpu_fn(void *arg)
 		xnu_logkv("xnu: linux64_cpu_entry returned on CPU", (u64_t)cpu);
 	}
 	g_xnu.stop_run = 1;
+	xnu_stop_commit();
 	g_xnu.cpu_running[cpu] = 0;
 	while (!fki_thread_should_stop()) {
 		fki_msleep(10);
@@ -136,7 +205,7 @@ int xnu_enter_arm_init(struct boot_args_v2 *ba)
 		xnu_logs("xnu: kernel collection mode");
 	} else {
 		struct fki_pac_keys saved;
-		unsigned long cookie = fki_enter(&xnu_W.xnu_keys, &saved);
+		unsigned long cookie = fki_enter(&g_world.xnu_keys, &saved);
 		int cnt = macho_rebase(&g_xnu.img);
 		u64_t mh_unslid = 0;
 		int segs;
@@ -195,14 +264,14 @@ int xnu_enter_arm_init(struct boot_args_v2 *ba)
 	__asm__ volatile("mrs %0, tcr_el1" : "=r"(tcr));
 	__asm__ volatile("mrs %0, ttbr0_el1" : "=r"(ttbr0));
 	/* User pmaps walk 47 bits from L0 with 4 KiB pages (T0SZ_HW=17) */
-	xnu_W.xnu_tcr = (tcr & ~(1ULL << 22) & ~0x3fULL & ~(3ULL << 14)) | 17ULL;
-	xnu_W.xnu_ttbr0 = ttbr0;
+	g_world.xnu_tcr = (tcr & ~(1ULL << 22) & ~0x3fULL & ~(3ULL << 14)) | 17ULL;
+	g_world.xnu_ttbr0 = ttbr0;
 
 	g_xnu.cpu_entry = macho_sym(&g_xnu.img, "_linux64_cpu_entry");
 	for (cpu = 1; cpu < g_xnu.cpus; cpu++) {
-		g_worlds[cpu].xnu_keys = xnu_W.xnu_keys;
-		g_worlds[cpu].xnu_tcr = xnu_W.xnu_tcr;
-		g_worlds[cpu].xnu_ttbr0 = xnu_W.xnu_ttbr0;
+		g_worlds[cpu].xnu_keys = g_world.xnu_keys;
+		g_worlds[cpu].xnu_tcr = g_world.xnu_tcr;
+		g_worlds[cpu].xnu_ttbr0 = g_world.xnu_ttbr0;
 	}
 	if (g_xnu.cpus > 1 && !g_xnu.cpu_entry) {
 		xnu_logs("xnu: missing linux64_cpu_entry, forcing 1 CPU");
@@ -226,6 +295,7 @@ int xnu_enter_arm_init(struct boot_args_v2 *ba)
 	ret = xnu_world_call(a_init, (unsigned long)ba);
 	g_xnu.in_xnu_slot[xnu_this_slot()] = 0;
 	g_xnu.stop_run = 1;
+	xnu_stop_commit();
 
 	for (cpu = 1; cpu < g_xnu.cpus; cpu++) {
 		for (slot_idx = 0; g_xnu.cpu_running[cpu] && slot_idx < 500;
@@ -427,8 +497,8 @@ static int __init xnu_init(void)
 		xnu_logkv("xnu: region size", g_xnu.img.region.size);
 	}
 
-	fki_random(&xnu_W.xnu_keys, sizeof(xnu_W.xnu_keys));
-	xnu_W.xnu_keys.sctlr_en = ~0ULL;
+	fki_random(&g_world.xnu_keys, sizeof(g_world.xnu_keys));
+	g_world.xnu_keys.sctlr_en = ~0ULL;
 
 	err = g_xnu.mode == 1 ? xnu_run_m1() :
 	      (g_xnu.mode == 3 || g_xnu.mode == 4) ? xnu_run_m2b() :

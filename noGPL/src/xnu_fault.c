@@ -95,6 +95,9 @@ static int heal_s1pie_perm(unsigned long far, unsigned long *esrp)
 		return 0;
 	}
 	idx = (far >> 30) & 511UL;
+	if (!g_xnu.window_owned[idx]) {
+		return 0;
+	}
 	desc = g_xnu.window_l1[idx];
 	if ((desc & 3ULL) == 1ULL) {
 		tbl = &g_xnu.window_l1[idx];

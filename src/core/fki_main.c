@@ -22,15 +22,15 @@ int fki_version(void)
 }
 EXPORT_SYMBOL(fki_version);
 
-void fki_log(const char *s, unsigned long len)
+void fki_log(const char *str, unsigned long len)
 {
-	pr_info("[fki] %.*s\n", (int)len, s);
+	pr_info("[fki] %.*s\n", (int)len, str);
 }
 EXPORT_SYMBOL(fki_log);
 
-void fki_log_alert(const char *s, unsigned long len)
+void fki_log_alert(const char *str, unsigned long len)
 {
-	pr_alert("[fki] %.*s\n", (int)len, s);
+	pr_alert("[fki] %.*s\n", (int)len, str);
 }
 EXPORT_SYMBOL(fki_log_alert);
 

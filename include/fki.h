@@ -52,13 +52,13 @@ extern "C" {
 #endif
 
 int fki_version(void);
-void fki_log(const char *s, unsigned long len);
-void fki_log_alert(const char *s, unsigned long len);
+void fki_log(const char *str, unsigned long len);
+void fki_log_alert(const char *str, unsigned long len);
 
-int fki_region_alloc(unsigned long size, struct fki_region *r);
-void fki_region_free(struct fki_region *r);
-int fki_contig_alloc(unsigned long size, struct fki_region *r);
-void fki_contig_free(struct fki_region *r);
+int fki_region_alloc(unsigned long size, struct fki_region *region);
+void fki_region_free(struct fki_region *region);
+int fki_contig_alloc(unsigned long size, struct fki_region *region);
+void fki_contig_free(struct fki_region *region);
 int fki_chunk_alloc_16k(unsigned long count, struct fki_chunk *chunks);
 void fki_chunk_free_16k(unsigned long count, struct fki_chunk *chunks);
 void *fki_valloc(unsigned long size);
@@ -108,8 +108,8 @@ unsigned long fki_regs_pc(void *regs);
 unsigned long fki_regs_lr(void *regs);
 unsigned long fki_regs_pstate(void *regs);
 void fki_regs_set_pc(void *regs, unsigned long pc);
-void fki_regs_set_reg(void *regs, unsigned int n, unsigned long v);
-unsigned long fki_regs_reg(void *regs, unsigned int n);
+void fki_regs_set_reg(void *regs, unsigned int idx, unsigned long val);
+unsigned long fki_regs_reg(void *regs, unsigned int idx);
 int fki_fault_register(unsigned long lo, unsigned long hi,
 		       int (*handler)(unsigned long far, unsigned long esr,
 				      void *regs));

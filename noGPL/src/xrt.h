@@ -7,47 +7,47 @@
 #ifndef XNU_XRT_H
 #define XNU_XRT_H
 
-static inline void *x_memcpy(void *d, const void *s, unsigned long n)
+static inline void *x_memcpy(void *dst, const void *src, unsigned long len)
 {
-	char *a = d;
-	const char *b = s;
+	char *out = dst;
+	const char *in = src;
 
-	while (n--) {
-		*a++ = *b++;
+	while (len--) {
+		*out++ = *in++;
 	}
-	return d;
+	return dst;
 }
 
-static inline int x_strncmp(const char *a, const char *b, unsigned long n)
+static inline int x_strncmp(const char *lhs, const char *rhs, unsigned long len)
 {
-	for (; n; n--, a++, b++) {
-		if (*a != *b) {
-			return (unsigned char)*a - (unsigned char)*b;
+	for (; len; len--, lhs++, rhs++) {
+		if (*lhs != *rhs) {
+			return (unsigned char)*lhs - (unsigned char)*rhs;
 		}
-		if (!*a) {
+		if (!*lhs) {
 			return 0;
 		}
 	}
 	return 0;
 }
 
-static inline int x_strcmp(const char *a, const char *b)
+static inline int x_strcmp(const char *lhs, const char *rhs)
 {
-	while (*a && *a == *b) {
-		a++;
-		b++;
+	while (*lhs && *lhs == *rhs) {
+		lhs++;
+		rhs++;
 	}
-	return (unsigned char)*a - (unsigned char)*b;
+	return (unsigned char)*lhs - (unsigned char)*rhs;
 }
 
-static inline unsigned long x_strlen(const char *s)
+static inline unsigned long x_strlen(const char *str)
 {
-	const char *p = s;
+	const char *ptr = str;
 
-	while (*p) {
-		p++;
+	while (*ptr) {
+		ptr++;
 	}
-	return p - s;
+	return ptr - str;
 }
 
 #endif

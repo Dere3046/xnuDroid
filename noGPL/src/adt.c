@@ -7,29 +7,29 @@
 #include "adt.h"
 #include "xrt.h"
 
-void adt_init(struct adt *a, void *buf, unsigned long cap)
+void adt_init(struct adt *adt, void *buf, unsigned long cap)
 {
-	a->buf = buf;
-	a->p = buf;
-	a->end = a->buf + cap;
-	a->err = 0;
+	adt->buf = buf;
+	adt->p = buf;
+	adt->end = adt->buf + cap;
+	adt->err = 0;
 }
 
-static void adt_put(struct adt *a, const void *v, unsigned long n)
+static void adt_put(struct adt *adt, const void *val, unsigned long len)
 {
-	if (a->p + n > a->end) {
-		a->err = 1;
+	if (adt->p + len > adt->end) {
+		adt->err = 1;
 		return;
 	}
-	x_memcpy(a->p, v, n);
-	a->p += n;
+	x_memcpy(adt->p, val, len);
+	adt->p += len;
 }
 
-void adt_node(struct adt *a, unsigned nprops, unsigned nchildren)
+void adt_node(struct adt *adt, unsigned nprops, unsigned nchildren)
 {
-	unsigned h[2] = { nprops, nchildren };
+	unsigned hdr[2] = { nprops, nchildren };
 
-	adt_put(a, h, sizeof(h));
+	adt_put(adt, hdr, sizeof(hdr));
 }
 
 void adt_prop(struct adt *adt, const char *name, const void *val,
@@ -46,17 +46,17 @@ void adt_prop(struct adt *adt, const char *name, const void *val,
 	adt_put(adt, zero, (4 - (len & 3)) & 3);
 }
 
-void adt_prop_str(struct adt *a, const char *name, const char *s)
+void adt_prop_str(struct adt *adt, const char *name, const char *str)
 {
-	adt_prop(a, name, s, x_strlen(s) + 1);
+	adt_prop(adt, name, str, x_strlen(str) + 1);
 }
 
-void adt_prop_u32(struct adt *a, const char *name, unsigned v)
+void adt_prop_u32(struct adt *adt, const char *name, unsigned val)
 {
-	adt_prop(a, name, &v, 4);
+	adt_prop(adt, name, &val, 4);
 }
 
-void adt_prop_u64(struct adt *a, const char *name, unsigned long long v)
+void adt_prop_u64(struct adt *adt, const char *name, unsigned long long val)
 {
-	adt_prop(a, name, &v, 8);
+	adt_prop(adt, name, &val, 8);
 }

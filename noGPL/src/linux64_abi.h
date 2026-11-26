@@ -47,6 +47,7 @@ enum linux64_call {
 	LINUX64_CALL_HOSTCALL = 830,
 	LINUX64_CALL_CPU_START = 840,
 	LINUX64_CALL_IPI = 841,
+	LINUX64_CALL_HALT = 992,
 	LINUX64_CALL_CONSOLE_READ = 993,
 	LINUX64_CALL_RAMDISK_RW = 994,
 	LINUX64_CALL_RAMDISK_SIZE = 995,
@@ -94,8 +95,10 @@ struct linux64_input_event {
 #define LINUX64_CPU_SLOTS 256
 #define LINUX64_CPU_SLOT(mpidr) ((unsigned)(((mpidr) & 0xf) | (((mpidr) >> 4) & 0xf0)))
 
+#define LINUX64_MAX_CPUS 32
+
 #define LINUX64_EL0_CLASSES 5
-#define LINUX64_EL0_CPUS 8
+#define LINUX64_EL0_CPUS LINUX64_MAX_CPUS
 
 enum linux64_counter {
 	LINUX64_CTR_IDLE_THREAD = 0,

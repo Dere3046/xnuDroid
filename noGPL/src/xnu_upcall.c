@@ -13,7 +13,7 @@
 
 typedef unsigned long (*strlen_fn)(const char *);
 
-static int quiet_line(const char *l, unsigned n)
+static int quiet_line(const char *line, unsigned len)
 {
 	static const char *const pfx[] = {
 		"com.apple.xpc.launchd|",
@@ -31,15 +31,15 @@ static int quiet_line(const char *l, unsigned n)
 
 	for (i = 0; i < sizeof(pfx) / sizeof(pfx[0]); i++) {
 		k = 0;
-		while (pfx[i][k] && k < n && l[k] == pfx[i][k]) {
+		while (pfx[i][k] && k < len && line[k] == pfx[i][k]) {
 			k++;
 		}
 		if (!pfx[i][k]) {
 			return 1;
 		}
 	}
-	for (k = 0; k + 18 <= n; k++) {
-		if (!x_strncmp(l + k, "triggered unnest", 16)) {
+	for (k = 0; k + 18 <= len; k++) {
+		if (!x_strncmp(line + k, "triggered unnest", 16)) {
 			return 1;
 		}
 	}
@@ -158,6 +158,7 @@ static __nocfi long handle_kernel_tables(unsigned long a1)
 		if (g_xnu.window_l1[i] &&
 		    &g_xnu.window_l1[i] != g_xnu.window_slot) {
 			xnu_logkv("xnu: L1 slot in use by Linux", i);
+			xnu_logkv("xnu:   linux L1 entry", g_xnu.window_l1[i]);
 			return 1;
 		}
 		fix_s1pie_desc(&tte[i], 1);
@@ -435,6 +436,13 @@ static long xnu_hook_body(unsigned long call, unsigned long a1,
 		return 0;
 	}
 
+	if (call == LINUX64_CALL_HALT) {
+		xnu_logs(a1 ?
+			 "xnu: the hosted system asked for a restart: run ended" :
+			 "xnu: the hosted system halted: run ended");
+		return 1;
+	}
+
 	if (call == LINUX64_CALL_PANIC) {
 		char msg[500];
 		const char *str = (const char *)a1;
@@ -522,8 +530,8 @@ long xnu_hook(unsigned long call, unsigned long a1, unsigned long a2)
 		}
 	}
 	g_xnu.in_xnu_slot[in_s] = 0;
-	if (*(volatile int *)&g_xnu.stop_run) {
-		xnu_logs("xnu: run stopped by the host");
+	if (*(volatile int *)&g_xnu.stop_run && xnu_stop_park()) {
+		xnu_logs("xnu: run stopped by the host (stop_run)");
 		return 1;
 	}
 	start_cnt = fki_counter();
@@ -531,6 +539,12 @@ long xnu_hook(unsigned long call, unsigned long a1, unsigned long a2)
 	ret = xnu_hook_body(call, a1, a2);
 	g_xnu.in_call_slot[in_s] = 0;
 	xnu_acct_add(call, fki_counter() - start_cnt);
+	if (ret) {
+		xnu_stop_commit();
+	} else if (*(volatile int *)&g_xnu.stop_run && xnu_stop_park()) {
+		xnu_logs("xnu: run stopped by the host (stop_run)");
+		ret = 1;
+	}
 	if (!ret) {
 		g_xnu.in_xnu_slot[in_s] = 1;
 	}

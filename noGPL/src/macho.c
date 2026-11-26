@@ -9,16 +9,19 @@
 #define ENOMEM 12
 #include "macho.h"
 
-#define FOR_EACH_LC(img, l) \
-	for (const struct lc *l = (const void *)((img)->file + sizeof(struct mh64)), \
-	     *_e = (const void *)((img)->file + sizeof(struct mh64) + \
-				  ((const struct mh64 *)(img)->file)->sizeofcmds); \
-	     l < _e; l = (const void *)((const char *)l + l->cmdsize))
+#define FOR_EACH_LC(img, pos, end) \
+	for ((pos) = (const void *)((img)->file + sizeof(struct mh64)), \
+	     (end) = (const void *)((img)->file + sizeof(struct mh64) + \
+				    ((const struct mh64 *)(img)->file)->sizeofcmds); \
+	     (pos) < (end); \
+	     (pos) = (const void *)((const char *)(pos) + (pos)->cmdsize))
 
 int macho_load(struct xnu_image *img, const void *file, unsigned long size,
 	       unsigned long extra)
 {
 	const struct mh64 *mh = file;
+	const struct lc *lc_it;
+	const struct lc *lc_end;
 	int err;
 
 	img->file = file;
@@ -31,7 +34,7 @@ int macho_load(struct xnu_image *img, const void *file, unsigned long size,
 	img->vmlow = ~0ULL;
 	img->vmhigh = 0;
 
-	FOR_EACH_LC(img, lc_it) {
+	FOR_EACH_LC(img, lc_it, lc_end) {
 		if (lc_it->cmd == LC_SEGMENT_64) {
 			const struct seg64 *seg = (const void *)lc_it;
 			const struct sect64 *sc;
@@ -75,7 +78,7 @@ int macho_load(struct xnu_image *img, const void *file, unsigned long size,
 
 	if (mh->filetype == MH_FILESET) {
 		img->symtab = 0;
-		FOR_EACH_LC(img, lc_it) {
+		FOR_EACH_LC(img, lc_it, lc_end) {
 			const struct fileset_entry_lc *fe;
 			const struct mh64 *kh;
 			const struct lc *kl;
@@ -121,7 +124,10 @@ int macho_load(struct xnu_image *img, const void *file, unsigned long size,
 
 int macho_copy(struct xnu_image *img, void *dst)
 {
-	FOR_EACH_LC(img, lc_it) {
+	const struct lc *lc_it;
+	const struct lc *lc_end;
+
+	FOR_EACH_LC(img, lc_it, lc_end) {
 		const struct seg64 *seg;
 
 		if (lc_it->cmd != LC_SEGMENT_64) {
@@ -240,6 +246,8 @@ static int macho_rebase_chained(struct xnu_image *img)
 int macho_rebase(struct xnu_image *img)
 {
 	u64_t mh_vm = 0;
+	const struct lc *lc_it;
+	const struct lc *lc_end;
 	u32_t *ts;
 	u32_t *te;
 	u32_t *off_ptr;
@@ -250,7 +258,7 @@ int macho_rebase(struct xnu_image *img)
 		return macho_rebase_chained(img);
 	}
 
-	FOR_EACH_LC(img, lc_it) {
+	FOR_EACH_LC(img, lc_it, lc_end) {
 		const struct seg64 *seg = (const void *)lc_it;
 
 		if (lc_it->cmd == LC_SEGMENT_64 &&
@@ -333,13 +341,15 @@ u64_t macho_sym(struct xnu_image *img, const char *name)
 int macho_slide_header(struct xnu_image *img, u64_t *mh_unslid)
 {
 	u64_t mh_vm = 0;
+	const struct lc *lc_it;
+	const struct lc *lc_end_file;
 	unsigned char *mh;
 	const struct mh64 *hdr;
 	struct lc *lc_cur;
 	struct lc *lc_end;
 	int cnt = 0;
 
-	FOR_EACH_LC(img, lc_it) {
+	FOR_EACH_LC(img, lc_it, lc_end_file) {
 		const struct seg64 *seg = (const void *)lc_it;
 
 		if (lc_it->cmd == LC_SEGMENT_64 &&

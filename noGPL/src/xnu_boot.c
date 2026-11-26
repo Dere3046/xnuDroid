@@ -17,7 +17,8 @@ typedef unsigned long (*strlen_fn)(const char *);
 typedef unsigned int (*crc32_fn)(unsigned int, const void *, unsigned long);
 
 static char g_root_matching[256];
-static const char g_cmdline[] = "debug=0x8 -v -noprogress serial=0 startup_debug=1";
+static const char g_cmdline[] =
+	"debug=0x8 -v -noprogress serial=0 startup_debug=1 bt-transport-override=10";
 static const char g_cmdline_4k[] = " vm_compression_limit=1572864";
 static const char g_cmdline_16k[] = " vm_compression_limit=393216 linux64_vm16k=1";
 
@@ -100,7 +101,7 @@ __nocfi int xnu_run_m1(void)
 	unsigned long len;
 	unsigned int crc;
 
-	cookie = fki_enter(&xnu_W.xnu_keys, &saved);
+	cookie = fki_enter(&g_world.xnu_keys, &saved);
 	cnt = macho_rebase(&g_xnu.img);
 	fki_leave(cookie, &saved);
 	xnu_logkv("xnu: threaded fixups applied", (u64_t)cnt);
@@ -116,7 +117,7 @@ __nocfi int xnu_run_m1(void)
 		return 0;
 	}
 
-	cookie = fki_enter(&xnu_W.xnu_keys, &saved);
+	cookie = fki_enter(&g_world.xnu_keys, &saved);
 	len = ((strlen_fn)sl)((const char *)ver);
 	crc = ((crc32_fn)cr)(0, (const void *)ver, len);
 	fki_leave(cookie, &saved);
@@ -156,6 +157,8 @@ static struct boot_args_v2 *build_boot(unsigned char *base_va, u64_t phys,
 		g_xnu.cpus = 1;
 	}
 	if (g_xnu.cpus > XNU_MAX_CPUS) {
+		xnu_logkv("xnu: more CPUs asked for than XNU is built for, using",
+			  (u64_t)XNU_MAX_CPUS);
 		g_xnu.cpus = XNU_MAX_CPUS;
 	}
 	if (g_xnu.cpus > fki_num_cpus()) {
@@ -176,7 +179,7 @@ static struct boot_args_v2 *build_boot(unsigned char *base_va, u64_t phys,
 		}
 		g_xnu.cpu_mpidr[cpu] = cpu_mpidr & 0xffff;
 		g_xnu.linux_cpu_of_slot[LINUX64_CPU_SLOT(cpu_mpidr)] = (signed char)cpu;
-		xnu_worlds[LINUX64_CPU_SLOT(cpu_mpidr)] = cpu ? &g_worlds[cpu] : &xnu_W;
+		xnu_worlds[LINUX64_CPU_SLOT(cpu_mpidr)] = cpu ? &g_worlds[cpu] : &g_world;
 	}
 
 	mpidr = g_xnu.cpu_mpidr[0];
@@ -184,7 +187,7 @@ static struct boot_args_v2 *build_boot(unsigned char *base_va, u64_t phys,
 	xnu_logkv("xnu: XNU CPUs", (u64_t)g_xnu.cpus);
 
 	adt_init(&adt, base_va + off_dt, 0x40000);
-	adt_node(&adt, 3, 6);
+	adt_node(&adt, 3, 7);
 	adt_prop_str(&adt, "name", "device-tree");
 	{
 		static char compat[96];
@@ -293,8 +296,8 @@ static struct boot_args_v2 *build_boot(unsigned char *base_va, u64_t phys,
 			cname[cpu][3] = '0' + cpu;
 			cname[cpu][4] = 0;
 		} else {
-			cname[cpu][3] = '1';
-			cname[cpu][4] = '0' + cpu - 10;
+			cname[cpu][3] = '0' + cpu / 10;
+			cname[cpu][4] = '0' + cpu % 10;
 			cname[cpu][5] = 0;
 		}
 		adt_node(&adt, 6, 0);
@@ -304,16 +307,27 @@ static struct boot_args_v2 *build_boot(unsigned char *base_va, u64_t phys,
 		adt_prop_u32(&adt, "reg", (unsigned)g_xnu.cpu_mpidr[cpu]);
 		adt_prop_u64(&adt, "timebase-frequency",
 			     fki_counter_frequency());
-		adt_prop_u32(&adt, "cluster-type", 'P');
+		adt_prop_u32(&adt, "cluster-type",
+			     ((g_xnu.ecpus >> cpu) & 1UL) ? 'E' : 'P');
 	}
 
 	adt_node(&adt, 1, 0);
 	adt_prop_str(&adt, "name", "defaults");
-	adt_node(&adt, 4, 0);
+	adt_node(&adt, 4 + (g_xnu.soc_name && g_xnu.soc_name[0] ? 1 : 0), 0);
 	adt_prop_str(&adt, "name", "product");
 	adt_prop_str(&adt, "sub-product-type", g_xnu.model);
 	adt_prop_str(&adt, "unique-model", g_xnu.model);
 	adt_prop_str(&adt, "product-name", "xnulinux");
+	if (g_xnu.soc_name && g_xnu.soc_name[0]) {
+		adt_prop_str(&adt, "product-soc-name", g_xnu.soc_name);
+	}
+	adt_node(&adt, 3 + (g_xnu.gpu_model && g_xnu.gpu_model[0] ? 1 : 0), 0);
+	adt_prop_str(&adt, "name", "sgx");
+	adt_prop_str(&adt, "device_type", "sgx");
+	adt_prop_str(&adt, "compatible", "xnulinux,gpu");
+	if (g_xnu.gpu_model && g_xnu.gpu_model[0]) {
+		adt_prop_str(&adt, "model", g_xnu.gpu_model);
+	}
 	adt_node(&adt, 1, 0);
 	adt_prop_str(&adt, "name", "options");
 
@@ -399,6 +413,17 @@ static struct boot_args_v2 *build_boot(unsigned char *base_va, u64_t phys,
 
 		x_memcpy(ba->command_line + x_strlen(ba->command_line), rd,
 			 x_strlen(rd) + 1);
+	}
+	{
+		const char *extra = fki_counter_frequency() != 24000000ULL ?
+			" ml-timeout-debug-ack-scale=100 droidvm-timebase-hz=24000000" :
+			" ml-timeout-debug-ack-scale=100";
+
+		if (x_strlen(ba->command_line) + x_strlen(extra) <
+		    sizeof(ba->command_line)) {
+			x_memcpy(ba->command_line + x_strlen(ba->command_line),
+				 extra, x_strlen(extra) + 1);
+		}
 	}
 	if (g_xnu.bootargs &&
 	    x_strlen(ba->command_line) + 1 + x_strlen(g_xnu.bootargs) <
@@ -557,18 +582,10 @@ static int pick_boot_window(const unsigned long long *l1, u64_t nat_base,
 			}
 		}
 		if (k == need_slots) {
-			lo = nat_idx;
-			while (lo > XNU_L1_FIRST && !l1[lo - 1]) {
-				lo--;
-			}
-			hi = nat_idx + need_slots - 1;
-			while (hi < XNU_L1_LAST && !l1[hi + 1]) {
-				hi++;
-			}
 			*win_base = nat_base;
 			*idx_out = nat_idx;
-			*first_out = lo;
-			*last_out = hi;
+			*first_out = XNU_L1_FIRST;
+			*last_out = XNU_L1_LAST;
 			return 0;
 		}
 	}

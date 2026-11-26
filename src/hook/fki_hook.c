@@ -265,6 +265,63 @@ static int fki_fault_pre(struct kprobe *p, struct pt_regs *kregs)
 }
 NOKPROBE_SYMBOL(fki_fault_pre);
 
+static bool arm64_insn_is_store(u32 insn)
+{
+	if ((insn & 0xffffffe0U) == 0xd50b7420U) {
+		return true;
+	}
+	if ((insn & 0x3f000000U) == 0x08000000U) {
+		if ((insn & 0x00a00000U) == 0x00a00000U) {
+			return true;
+		}
+		return !(insn & (1U << 22));
+	}
+	if ((insn & 0x3a000000U) == 0x28000000U) {
+		return !(insn & (1U << 22));
+	}
+	if ((insn & 0x3a000000U) == 0x38000000U) {
+		if (!(insn & (1U << 26)) && !(insn & (1U << 24)) &&
+		    (insn & (1U << 21)) && (insn & 0x00000c00U) == 0U) {
+			if ((insn & 0x3ffffc00U) == 0x38bfc000U) {
+				return false;
+			}
+			return true;
+		}
+		if (insn & (1U << 26)) {
+			return !(insn & (1U << 22));
+		}
+		return ((insn >> 22) & 3U) == 0U;
+	}
+	if ((insn & 0xbf000000U) == 0x0c000000U) {
+		return !(insn & (1U << 22));
+	}
+	return false;
+}
+NOKPROBE_SYMBOL(arm64_insn_is_store);
+
+static unsigned long synthesize_fixup_esr(void *regs, unsigned long far)
+{
+	u64 *pc_ptr = pt_regs_pc_ptr(regs);
+	unsigned long pc;
+	u32 insn;
+
+	if (!pc_ptr) {
+		return 0x96000007UL;
+	}
+	pc = *pc_ptr;
+	if (far == pc) {
+		return 0x86000007UL;
+	}
+	if (pc >= g_fault_lo && pc < g_fault_hi && !(pc & 3UL)) {
+		insn = *(const u32 *)pc;
+		if (arm64_insn_is_store(insn)) {
+			return 0x9600004fUL;
+		}
+	}
+	return 0x96000007UL;
+}
+NOKPROBE_SYMBOL(synthesize_fixup_esr);
+
 static int fki_fixup_pre(struct kprobe *p, struct pt_regs *kregs)
 {
 	u64 *karr = pt_regs_arr(kregs);
@@ -278,7 +335,7 @@ static int fki_fixup_pre(struct kprobe *p, struct pt_regs *kregs)
 	esr = read_sysreg(esr_el1);
 	/* Kprobe BRK #4 on fixup_exception overwrites ESR_EL1 */
 	if ((esr >> 26) == 0x3c) {
-		esr = 0x9600004fUL;
+		esr = synthesize_fixup_esr((void *)karr[0], far);
 	}
 	if (fki_fault_common((void *)karr[0], far, esr)) {
 		return 0;
@@ -368,24 +425,24 @@ void fki_regs_set_pc(void *regs, unsigned long pc)
 }
 EXPORT_SYMBOL(fki_regs_set_pc);
 
-void fki_regs_set_reg(void *regs, unsigned int n, unsigned long v)
+void fki_regs_set_reg(void *regs, unsigned int idx, unsigned long val)
 {
 	u64 *arr = pt_regs_arr(regs);
 
-	if (arr && n < 31) {
-		arr[n] = v;
+	if (arr && idx < 31) {
+		arr[idx] = val;
 	}
 }
 EXPORT_SYMBOL(fki_regs_set_reg);
 
-unsigned long fki_regs_reg(void *regs, unsigned int n)
+unsigned long fki_regs_reg(void *regs, unsigned int idx)
 {
 	u64 *arr = pt_regs_arr(regs);
 
-	if (!arr || n >= 31) {
+	if (!arr || idx >= 31) {
 		return 0;
 	}
-	return arr[n];
+	return arr[idx];
 }
 EXPORT_SYMBOL(fki_regs_reg);
 

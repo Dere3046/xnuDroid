@@ -78,6 +78,17 @@ static void *g_alt_stack[NR_CPUS];
 static struct task_struct *g_idle_task[NR_CPUS];
 static atomic_t g_kick_claimed[NR_CPUS];
 static DEFINE_PER_CPU(call_single_data_t, g_kick_csd);
+static int g_cpu_list[NR_CPUS];
+static int g_cpu_list_n;
+module_param_array_named(cpu_list, g_cpu_list, int, &g_cpu_list_n, 0444);
+
+static int fki_cpu_map(int cpu)
+{
+	if (!g_cpu_list_n) {
+		return cpu;
+	}
+	return (cpu >= 0 && cpu < g_cpu_list_n) ? g_cpu_list[cpu] : -1;
+}
 
 void fki_run_on_stack(void (*fn)(void *), void *arg, void *top);
 
@@ -464,7 +475,7 @@ static void fki_idle_body(void *ptr)
 
 	local_irq_enable();
 	preempt_enable();
-	set_current_state(TASK_UNINTERRUPTIBLE);
+	set_current_state(TASK_IDLE);
 	WRITE_ONCE(g_idle_task[smp_processor_id()], current);
 	smp_mb();
 	if (!args->wake || !READ_ONCE(*args->wake)) {
@@ -522,6 +533,7 @@ void fki_kick_cpu(int cpu)
 {
 	struct task_struct *task;
 
+	cpu = fki_cpu_map(cpu);
 	if (cpu < 0 || cpu >= nr_cpu_ids) {
 		return;
 	}
@@ -550,6 +562,7 @@ int fki_cpu_mpidr(int cpu, fki_u64 *mpidr)
 	u64 val = 0;
 	int err;
 
+	cpu = fki_cpu_map(cpu);
 	if (cpu < 0 || cpu >= nr_cpu_ids || !cpu_online(cpu) || !mpidr) {
 		return -EINVAL;
 	}
@@ -561,12 +574,13 @@ EXPORT_SYMBOL(fki_cpu_mpidr);
 
 int fki_num_cpus(void)
 {
-	return num_online_cpus();
+	return g_cpu_list_n ? g_cpu_list_n : num_online_cpus();
 }
 EXPORT_SYMBOL(fki_num_cpus);
 
 int fki_bind_cpu(int cpu)
 {
+	cpu = fki_cpu_map(cpu);
 	if (cpu < 0 || cpu >= nr_cpu_ids || !cpu_online(cpu)) {
 		return -EINVAL;
 	}
@@ -578,6 +592,7 @@ void *fki_thread_start(int (*fn)(void *), void *arg, int cpu, const char *name)
 {
 	struct task_struct *task;
 
+	cpu = fki_cpu_map(cpu);
 	if (!fn || cpu < 0 || cpu >= nr_cpu_ids || !cpu_online(cpu) ||
 	    !fki_layout_ok(FKI_LAY_TASK_USAGE)) {
 		return NULL;
@@ -631,7 +646,12 @@ EXPORT_SYMBOL(fki_thread_wake);
 
 void fki_msleep(unsigned int ms)
 {
-	call_msleep(ms);
+	unsigned long timeout = msecs_to_jiffies(ms) + 1;
+
+	while (timeout) {
+		__set_current_state(TASK_IDLE);
+		timeout = call_schedule_timeout(timeout);
+	}
 }
 EXPORT_SYMBOL(fki_msleep);
 

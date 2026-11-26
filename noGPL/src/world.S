@@ -72,8 +72,12 @@ xnu_world_call:
 xnu_world_abort:
 	W(x9)
 	mov	x19, #1
+	b	3f
+xnu_world_abort_mm:
+	W(x9)
+	mov	x19, #1
 2:	TO_LINUX_MM
-	ldr	x18, [x9, #464]
+3:	ldr	x18, [x9, #464]
 	ldr	x10, [x9, #216]
 	msr	tpidr_el0, x10
 	ldr	x10, [x9, #224]
@@ -101,7 +105,7 @@ xnu_world_fault_abort:
 	add	x0, x9, #240
 	add	x1, x9, #328
 	bl	fki_pac_swap
-	b	xnu_world_abort
+	b	xnu_world_abort_mm
 	.size	xnu_world_fault_abort, . - xnu_world_fault_abort
 
 	.globl	xnu_world_upcall

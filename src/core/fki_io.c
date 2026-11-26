@@ -80,7 +80,7 @@ typedef void (*consume_skb_fn)(struct sk_buff *skb);
 
 static struct net_device *g_netdev;
 static struct sk_buff_head g_net_rxq;
-static struct net_device_ops fki_net_ops;
+static struct net_device_ops g_net_ops;
 
 static __nocfi noinline struct file *call_filp_open(const char *path, int flags,
 						    umode_t mode)
@@ -788,12 +788,12 @@ int fki_io_init(void)
 		pr_warn("[fki] xnu0 disabled: net_device support unavailable\n");
 		return 0;
 	}
-	fki_net_ops.ndo_open = fki_net_up;
-	fki_net_ops.ndo_stop = fki_net_down;
-	fki_net_ops.ndo_start_xmit = fki_net_xmit;
-	fki_net_ops.ndo_set_mac_address =
+	g_net_ops.ndo_open = fki_net_up;
+	g_net_ops.ndo_stop = fki_net_down;
+	g_net_ops.ndo_start_xmit = fki_net_xmit;
+	g_net_ops.ndo_set_mac_address =
 		(void *)fki_sym_addr(FKI_SYM_ETH_MAC_ADDR);
-	fki_net_ops.ndo_validate_addr =
+	g_net_ops.ndo_validate_addr =
 		(void *)fki_sym_addr(FKI_SYM_ETH_VALIDATE_ADDR);
 
 	dev = call_alloc_etherdev();
@@ -806,7 +806,7 @@ int fki_io_init(void)
 	min_mtu = (unsigned int *)fki_layout_ptr(dev, FKI_LAY_NETDEV_MIN_MTU);
 	max_mtu = (unsigned int *)fki_layout_ptr(dev, FKI_LAY_NETDEV_MAX_MTU);
 	memcpy(name, "xnu0", 5);
-	*ops = &fki_net_ops;
+	*ops = &g_net_ops;
 	netdev_set_random_addr(dev);
 	*min_mtu = 68;
 	*max_mtu = ETH_DATA_LEN;

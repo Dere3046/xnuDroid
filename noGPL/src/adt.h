@@ -14,16 +14,16 @@ struct adt {
 	int err;
 };
 
-void adt_init(struct adt *a, void *buf, unsigned long cap);
-void adt_node(struct adt *a, unsigned nprops, unsigned nchildren);
-void adt_prop(struct adt *a, const char *name, const void *val, unsigned len);
-void adt_prop_str(struct adt *a, const char *name, const char *s);
-void adt_prop_u32(struct adt *a, const char *name, unsigned v);
-void adt_prop_u64(struct adt *a, const char *name, unsigned long long v);
+void adt_init(struct adt *adt, void *buf, unsigned long cap);
+void adt_node(struct adt *adt, unsigned nprops, unsigned nchildren);
+void adt_prop(struct adt *adt, const char *name, const void *val, unsigned len);
+void adt_prop_str(struct adt *adt, const char *name, const char *str);
+void adt_prop_u32(struct adt *adt, const char *name, unsigned val);
+void adt_prop_u64(struct adt *adt, const char *name, unsigned long long val);
 
-static inline unsigned long adt_size(struct adt *a)
+static inline unsigned long adt_size(struct adt *adt)
 {
-	return a->p - a->buf;
+	return adt->p - adt->buf;
 }
 
 #endif

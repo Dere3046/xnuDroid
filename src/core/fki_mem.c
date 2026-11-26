@@ -64,12 +64,12 @@ typedef void *(*memremap_fn)(resource_size_t offset, size_t size,
 typedef void (*memunmap_fn)(void *addr);
 typedef void (*set_swapper_pgd_fn)(pgd_t *pgdp, pgd_t pgd);
 
-static unsigned long carve_base;
-module_param(carve_base, ulong, 0444);
-static unsigned long carve_mb;
-module_param(carve_mb, ulong, 0444);
-static unsigned long reserve_mb;
-module_param(reserve_mb, ulong, 0444);
+static unsigned long g_carve_base;
+module_param_named(carve_base, g_carve_base, ulong, 0444);
+static unsigned long g_carve_mb;
+module_param_named(carve_mb, g_carve_mb, ulong, 0444);
+static unsigned long g_reserve_mb;
+module_param_named(reserve_mb, g_reserve_mb, ulong, 0444);
 
 static struct page *g_resv_pg;
 static unsigned long g_resv_cnt;
@@ -119,7 +119,7 @@ static __nocfi noinline int call_alloc_contig_range(unsigned long start,
 	}
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 1, 0)
 	{
-		struct acr_info info = {};
+		struct acr_info info = { 0 };
 
 		return fn(start, end, MIGRATE_MOVABLE, gfp, &info);
 	}
@@ -473,27 +473,27 @@ int fki_contig_alloc(unsigned long size, struct fki_region *region)
 		return 0;
 	}
 
-	if (carve_mb && !g_carve_used &&
-	    ALIGN(size, SZ_2M) <= (carve_mb << 20) &&
-	    !(carve_base & (SZ_2M - 1))) {
+	if (g_carve_mb && !g_carve_used &&
+	    ALIGN(size, SZ_2M) <= (g_carve_mb << 20) &&
+	    !(g_carve_base & (SZ_2M - 1))) {
 		unsigned long clen = ALIGN(size, SZ_2M);
 		void *va;
 
-		err = fki_carve_check(carve_base, clen);
+		err = fki_carve_check(g_carve_base, clen);
 		if (err) {
 			return err;
 		}
-		va = call_memremap(carve_base, clen, MEMREMAP_WB);
+		va = call_memremap(g_carve_base, clen, MEMREMAP_WB);
 		if (va) {
 			g_carve_used = true;
 			region->va = va;
 			region->size = clen;
 			memset(region->va, 0, region->size);
-			region->pa = carve_base;
+			region->pa = g_carve_base;
 			region->handle = (void *)4UL;
 			return 0;
 		}
-		pr_warn("[fki] carve at %#lx not mappable\n", carve_base);
+		pr_warn("[fki] carve at %#lx not mappable\n", g_carve_base);
 	}
 
 	if (g_resv_pg && !g_resv_used &&
@@ -908,18 +908,19 @@ int fki_mem_init(void)
 {
 	unsigned long cnt;
 
-	if (carve_mb) {
-		pr_info("[fki] carve %lu MiB at %#lx\n", carve_mb, carve_base);
+	if (g_carve_mb) {
+		pr_info("[fki] carve %lu MiB at %#lx\n", g_carve_mb,
+			g_carve_base);
 	}
-	if (!reserve_mb) {
+	if (!g_reserve_mb) {
 		return 0;
 	}
-	cnt = ALIGN(reserve_mb << 20, SZ_2M) >> PAGE_SHIFT;
+	cnt = ALIGN(g_reserve_mb << 20, SZ_2M) >> PAGE_SHIFT;
 	g_resv_pg = call_cma_alloc(cnt);
 	if (g_resv_pg) {
 		g_resv_cnt = cnt;
 	}
-	pr_info("[fki] reserve %lu MiB %s\n", reserve_mb,
+	pr_info("[fki] reserve %lu MiB %s\n", g_reserve_mb,
 		g_resv_pg ? "ok" : "failed");
 	return 0;
 }

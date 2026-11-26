@@ -12,7 +12,7 @@
 #include "world.h"
 #include "xrt.h"
 
-#define XNU_MAX_CPUS 16
+#define XNU_MAX_CPUS LINUX64_MAX_CPUS
 #define XNU_L1_FIRST 384
 #define XNU_L1_LAST 495
 #define XNU_L1_SCAN_LO 258
@@ -81,6 +81,9 @@ struct xnu_ctx {
 	char *preboot_uuid;
 	char *root_uuid;
 	char *model;
+	char *soc_name;
+	char *gpu_model;
+	unsigned long ecpus;
 	int vm16k;
 	int park_secondaries;
 	int perf;
@@ -173,5 +176,7 @@ static inline void xnu_logs_alert(const char *s)
 
 void xnu_logkv(const char *k, u64_t v);
 int xnu_enter_arm_init(struct boot_args_v2 *ba);
+void xnu_stop_commit(void);
+int xnu_stop_park(void);
 
 #endif

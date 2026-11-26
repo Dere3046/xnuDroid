@@ -36,7 +36,7 @@ _Static_assert(sizeof(struct fki_pac_keys) == 88, "fki_pac_keys layout");
 _Static_assert(__builtin_offsetof(struct xnu_world, xnu_keys) == 328,
 	       "xnu_world layout");
 
-extern struct xnu_world xnu_W;
+extern struct xnu_world g_world;
 extern struct xnu_world *xnu_worlds[];
 
 long xnu_world_call(unsigned long fn, unsigned long arg);
